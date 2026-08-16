@@ -1,0 +1,51 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          # AGP 9.3 needs JDK 17 minimum; 21 is supported and faster.
+          java-version: '21'
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      # The runner image already ships the SDK platforms, build-tools and NDK
+      # this project needs, so there is no setup-android step. The NDK version
+      # is pinned in audio/build.gradle.kts because the image default is 27
+      # while AGP 9.3 expects 28.x.
+      - name: Unit tests
+        run: ./gradlew :core:test --no-daemon
+
+      - name: Assemble release APK
+        run: ./gradlew :app:assembleRelease --no-daemon
+
+      - name: Verify signature and 16 KB alignment
+        run: |
+          BT="$ANDROID_HOME/build-tools/36.0.0"
+          [ -d "$BT" ] || BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          APK=app/build/outputs/apk/release/app-release.apk
+          "$BT/apksigner" verify --verbose --print-certs "$APK"
+          # Android 16 warns about 4 KB-aligned native libraries and Android 17
+          # can be configured to reject them outright.
+          "$BT/zipalign" -c -P 16 -v 4 "$APK" | tail -1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: master-key-debug-apk
+          path: app/build/outputs/apk/release/app-release.apk
+          retention-days: 14

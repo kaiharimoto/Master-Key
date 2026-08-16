@@ -1,0 +1,80 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to build, e.g. 1.0.1 (published as a prerelease)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Resolve version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            V="${GITHUB_REF_NAME#v}"
+          else
+            V="${{ inputs.version }}"
+          fi
+          if ! echo "$V" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "Version must be MAJOR.MINOR.PATCH, got '$V'" >&2
+            exit 1
+          fi
+          # Same formula as app/build.gradle.kts and UpdateRepository.kt.
+          # If you change it, change it in all three.
+          IFS=. read -r MA MI PA <<< "$V"
+          echo "name=$V" >> "$GITHUB_OUTPUT"
+          echo "code=$(( MA * 10000 + MI * 100 + PA ))" >> "$GITHUB_OUTPUT"
+
+      - name: Unit tests
+        run: ./gradlew :core:test --no-daemon
+
+      # No signing secrets: the release keystore is committed on purpose.
+      # See KEYS.md for why, and for why it must never be regenerated.
+      - name: Build signed release APK
+        run: |
+          ./gradlew :app:assembleRelease --no-daemon \
+            -PappVersionName=${{ steps.version.outputs.name }} \
+            -PappVersionCode=${{ steps.version.outputs.code }}
+
+      - name: Verify the APK
+        run: |
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          APK=app/build/outputs/apk/release/app-release.apk
+          "$BT/apksigner" verify --verbose --print-certs "$APK"
+          "$BT/zipalign" -c -P 16 -v 4 "$APK" | tail -1
+          # The in-app updater compares versionCode, so a mismatch between the
+          # tag and the APK would silently stop updates from being offered.
+          "$BT/aapt2" dump badging "$APK" | head -1
+
+      - name: Name the asset
+        run: |
+          mv app/build/outputs/apk/release/app-release.apk \
+             master-key-${{ steps.version.outputs.name }}.apk
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.name }}
+          name: Master Key ${{ steps.version.outputs.name }}
+          files: master-key-${{ steps.version.outputs.name }}.apk
+          generate_release_notes: true
+          # A manual run publishes a prerelease, which /releases/latest ignores —
+          # so the pipeline can be exercised without the app seeing an update.
+          prerelease: ${{ github.event_name == 'workflow_dispatch' }}
