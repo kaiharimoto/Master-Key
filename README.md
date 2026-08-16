@@ -104,6 +104,15 @@ git tag v1.0.1 && git push --tags
 CI builds, verifies the signature and 16 KB page alignment, and publishes the APK
 to a GitHub release. The app picks it up on next launch.
 
+You can also run the **Release** workflow manually from the Actions tab, which
+does the same thing and creates the tag for you. It publishes a prerelease by
+default — `/releases/latest` ignores those, so you can exercise the pipeline
+without the installed app treating it as an update; untick the box to cut a real
+release.
+
+Versions are immutable: republishing an existing version is refused, because
+overwriting a release would break the updater for anyone already on it.
+
 ## Licences
 
 Master Key bundles Verovio (LGPL-3.0) as a separate, replaceable asset,

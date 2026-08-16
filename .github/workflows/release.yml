@@ -31,13 +31,20 @@ jobs:
 
       - name: Resolve version
         id: version
+        env:
+          # Via env, never interpolated straight into the script: an input is
+          # attacker-controllable text, and this job holds contents:write plus
+          # the signing key.
+          EVENT: ${{ github.event_name }}
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
-          if [ "${{ github.event_name }}" = "push" ]; then
+          set -euo pipefail
+          if [ "$EVENT" = "push" ]; then
             V="${GITHUB_REF_NAME#v}"
           else
-            V="${{ inputs.version }}"
+            V="$INPUT_VERSION"
           fi
-          if ! echo "$V" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+          if ! printf '%s' "$V" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
             echo "Version must be MAJOR.MINOR.PATCH, got '$V'" >&2
             exit 1
           fi
@@ -46,6 +53,23 @@ jobs:
           IFS=. read -r MA MI PA <<< "$V"
           echo "name=$V" >> "$GITHUB_OUTPUT"
           echo "code=$(( MA * 10000 + MI * 100 + PA ))" >> "$GITHUB_OUTPUT"
+
+      # Publishing over an existing tag would update that release in place. With
+      # the default prerelease=true that silently demotes a published release,
+      # and /releases/latest then 404s — every installed app would report "no
+      # releases published yet". Refuse instead: versions are immutable.
+      - name: Refuse to overwrite an existing release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: v${{ steps.version.outputs.name }}
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] &&
+             gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG already exists. Bump the version instead of" >&2
+            echo "republishing — overwriting it would break the in-app updater." >&2
+            exit 1
+          fi
 
       - name: Unit tests
         run: ./gradlew :core:test --no-daemon
@@ -85,6 +109,7 @@ jobs:
           # publish a real one when that is what you actually want.
           prerelease: >-
             ${{ github.event_name == 'workflow_dispatch' && inputs.prerelease }}
-          # action-gh-release creates the tag if it does not exist yet, so a
-          # dispatched run is a complete release path on its own.
+          # Creates the tag when it does not exist, which makes a dispatched run
+          # a complete release path on its own. The step above guarantees it does
+          # not exist, so this always points at the commit that was built.
           target_commitish: ${{ github.sha }}
