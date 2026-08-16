@@ -18,6 +18,8 @@ import dev.kaiharimoto.masterkey.core.model.Piece
 import dev.kaiharimoto.masterkey.core.score.ScoreDocument
 import dev.kaiharimoto.masterkey.data.SongEntity
 import dev.kaiharimoto.masterkey.data.SongRepository
+import dev.kaiharimoto.masterkey.playback.PlaybackService
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -86,6 +88,26 @@ class PlayerViewModel(
                     metronomeEnabled = playback.metronomeEnabled,
                     currentBar = _state.value.model?.barNumberAt(playback.positionTick) ?: 1,
                 )
+                if (playback.isPlaying) {
+                    PlaybackService.start(getApplication(), _state.value.song?.title.orEmpty())
+                } else {
+                    PlaybackService.stop(getApplication())
+                }
+            }
+        }
+        // Adaptive key range. Checked a few times a second rather than per frame:
+        // the range only changes at section boundaries, and the highway animates
+        // the transition itself.
+        viewModelScope.launch {
+            while (true) {
+                val sections = _state.value.sections
+                if (sections.size > 1) {
+                    val target = sections.rangeAt(engine.positionTickNow(), _state.value.range)
+                    if (target != _state.value.range) {
+                        _state.value = _state.value.copy(range = target)
+                    }
+                }
+                delay(RANGE_POLL_MS)
             }
         }
     }
@@ -323,11 +345,14 @@ class PlayerViewModel(
 
     override fun onCleared() {
         engine.pause()
+        PlaybackService.stop(getApplication())
         super.onCleared()
     }
 
     companion object {
         val DRILL_TEMPI = listOf(0.6f, 0.9f, 0.7f, 1.0f, 0.8f, 1.0f)
+
+        private const val RANGE_POLL_MS = 300L
 
         fun factory(songId: String) = object : ViewModelProvider.Factory {
             @Suppress("UNCHECKED_CAST")

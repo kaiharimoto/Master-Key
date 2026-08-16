@@ -1,9 +1,14 @@
 package dev.kaiharimoto.masterkey
 
+import android.Manifest
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.ContextCompat
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.MaterialTheme
@@ -20,11 +25,15 @@ import dev.kaiharimoto.masterkey.ui.theme.MasterKeyTheme
 
 class MainActivity : ComponentActivity() {
 
+    private val requestNotifications =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         // Mandatory from targetSdk 35 onwards — there is no opt-out, so insets are
         // consumed explicitly by each screen rather than papered over.
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
+        askForNotificationPermission()
 
         setContent {
             MasterKeyTheme {
@@ -36,6 +45,21 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    /**
+     * The playback foreground service needs a notification to exist at all. On
+     * API 33+ that notification is suppressed without this permission, so the
+     * service would run invisibly and the user would have no way to get back to
+     * a piece that is still playing.
+     */
+    private fun askForNotificationPermission() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+        val granted = ContextCompat.checkSelfPermission(
+            this,
+            Manifest.permission.POST_NOTIFICATIONS,
+        ) == PackageManager.PERMISSION_GRANTED
+        if (!granted) requestNotifications.launch(Manifest.permission.POST_NOTIFICATIONS)
     }
 }
 
