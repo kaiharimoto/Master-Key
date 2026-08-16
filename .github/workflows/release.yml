@@ -6,8 +6,12 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version to build, e.g. 1.0.1 (published as a prerelease)'
+        description: 'Version to build, e.g. 1.0.1'
         required: true
+      prerelease:
+        description: 'Publish as a prerelease (the app ignores prereleases)'
+        type: boolean
+        default: true
 
 permissions:
   contents: write
@@ -75,6 +79,12 @@ jobs:
           name: Master Key ${{ steps.version.outputs.name }}
           files: master-key-${{ steps.version.outputs.name }}.apk
           generate_release_notes: true
-          # A manual run publishes a prerelease, which /releases/latest ignores —
-          # so the pipeline can be exercised without the app seeing an update.
-          prerelease: ${{ github.event_name == 'workflow_dispatch' }}
+          # Tag pushes are always real releases. A manual run defaults to a
+          # prerelease — /releases/latest ignores those, so the pipeline can be
+          # exercised without the installed app seeing it as an update — but can
+          # publish a real one when that is what you actually want.
+          prerelease: >-
+            ${{ github.event_name == 'workflow_dispatch' && inputs.prerelease }}
+          # action-gh-release creates the tag if it does not exist yet, so a
+          # dispatched run is a complete release path on its own.
+          target_commitish: ${{ github.sha }}
