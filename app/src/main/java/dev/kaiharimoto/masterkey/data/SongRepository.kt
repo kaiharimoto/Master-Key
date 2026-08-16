@@ -4,6 +4,9 @@ import android.content.Context
 import android.net.Uri
 import android.provider.OpenableColumns
 import dev.kaiharimoto.masterkey.core.keyboard.KeyRangeSelector
+import dev.kaiharimoto.masterkey.core.library.LibraryScanner
+import dev.kaiharimoto.masterkey.core.library.SongManifest
+import dev.kaiharimoto.masterkey.core.library.SongSettingsManifest
 import dev.kaiharimoto.masterkey.core.midi.MidiLoader
 import dev.kaiharimoto.masterkey.core.midi.MidiParseException
 import dev.kaiharimoto.masterkey.core.model.Piece
@@ -43,7 +46,17 @@ class SongRepository(
 
     suspend fun find(id: String): SongEntity? = songDao.find(id)
 
-    suspend fun update(song: SongEntity) = songDao.update(song)
+    /**
+     * Persists a song, mirroring its settings into the on-disk manifest.
+     *
+     * The manifest is what makes the database rebuildable, so it has to stay
+     * current — otherwise a recovery would restore the music but reset how you
+     * had set the piece up.
+     */
+    suspend fun update(song: SongEntity) = withContext(Dispatchers.IO) {
+        songDao.update(song)
+        LibraryScanner.write(folderFor(song), song.toManifest())
+    }
 
     suspend fun touch(id: String) = songDao.touch(id)
 
@@ -210,8 +223,83 @@ class SongRepository(
             originalBpm = piece.tempoMap.bpmAt(0),
         )
         songDao.upsert(song)
+        LibraryScanner.write(
+            folder,
+            song.toManifest(originalMidiName = midiName, originalScoreName = scoreName),
+        )
         return song
     }
+
+    /**
+     * Rebuilds the database index by rescanning the song folders on disk.
+     *
+     * The files are the source of truth; the database is a cache over them. This
+     * is what makes a database reset recoverable rather than destructive, and it
+     * is also how a restore onto a new device repopulates itself — the backup
+     * carries the music, not the fragile index.
+     *
+     * Existing rows are left alone, so this is safe to run at any time.
+     */
+    suspend fun rebuildFromDisk(): Int = withContext(Dispatchers.IO) {
+        val known = songDao.all().map { it.folder }.toSet()
+        var recovered = 0
+
+        for (found in LibraryScanner.scan(libraryRoot)) {
+            if (found.folder.name in known) continue
+            val midi = found.midiFile ?: continue
+
+            val piece = runCatching { MidiLoader.load(midi.readBytes()) }.getOrNull() ?: continue
+            val manifest = found.manifest
+            val range = piece.pitchRange
+            val settings = manifest?.settings ?: SongSettingsManifest()
+
+            songDao.upsert(
+                SongEntity(
+                    id = manifest?.id ?: found.folder.name,
+                    title = manifest?.title
+                        ?: LibraryScanner.titleFromFileName(
+                            manifest?.originalMidiName ?: midi.name,
+                        ),
+                    composer = manifest?.composer,
+                    folder = found.folder.name,
+                    midiFileName = midi.name,
+                    scoreFileName = found.scoreFile?.name,
+                    durationMicros = piece.durationMicros,
+                    barCount = countBars(piece),
+                    noteCount = piece.notes.size,
+                    pitchLow = range?.first ?: 21,
+                    pitchHigh = range?.last ?: 108,
+                    keySignature = piece.keySignatureAt(0)?.displayName,
+                    timeSignature = piece.timeSignatureAt(0).toString(),
+                    originalBpm = piece.tempoMap.bpmAt(0),
+                    importedAt = manifest?.importedAt?.takeIf { it > 0 }
+                        ?: System.currentTimeMillis(),
+                    tempoScale = settings.tempoScale,
+                    scaffoldLevel = settings.scaffoldLevel,
+                    noteNameStyle = settings.noteNameStyle,
+                    colorMode = settings.colorMode,
+                    pinnedRangeLow = settings.pinnedRangeLow,
+                    pinnedRangeHigh = settings.pinnedRangeHigh,
+                    rightHandMuted = settings.rightHandMuted,
+                    leftHandMuted = settings.leftHandMuted,
+                    metronomeEnabled = settings.metronomeEnabled,
+                    countInBars = settings.countInBars,
+                    showScore = settings.showScore,
+                    lookAheadBeats = settings.lookAheadBeats,
+                ),
+            )
+            recovered++
+        }
+        recovered
+    }
+
+    /** True when there are song folders on disk that the database doesn't know about. */
+    suspend fun hasUnindexedSongs(): Boolean = withContext(Dispatchers.IO) {
+        val known = songDao.all().map { it.folder }.toSet()
+        LibraryScanner.scan(libraryRoot).any { it.folder.name !in known }
+    }
+
+    private fun folderFor(song: SongEntity) = File(libraryRoot, song.folder)
 
     private fun countBars(piece: Piece): Int {
         val signature = piece.timeSignatureAt(0)
@@ -261,6 +349,35 @@ class SongRepository(
             }
             .ifBlank { "Untitled" }
 }
+
+/** Projects a row into the manifest stored beside its files. */
+fun SongEntity.toManifest(
+    originalMidiName: String? = null,
+    originalScoreName: String? = null,
+) = SongManifest(
+    id = id,
+    title = title,
+    composer = composer,
+    midiFileName = midiFileName,
+    scoreFileName = scoreFileName,
+    originalMidiName = originalMidiName,
+    originalScoreName = originalScoreName,
+    importedAt = importedAt,
+    settings = SongSettingsManifest(
+        tempoScale = tempoScale,
+        scaffoldLevel = scaffoldLevel,
+        noteNameStyle = noteNameStyle,
+        colorMode = colorMode,
+        pinnedRangeLow = pinnedRangeLow,
+        pinnedRangeHigh = pinnedRangeHigh,
+        rightHandMuted = rightHandMuted,
+        leftHandMuted = leftHandMuted,
+        metronomeEnabled = metronomeEnabled,
+        countInBars = countInBars,
+        showScore = showScore,
+        lookAheadBeats = lookAheadBeats,
+    ),
+)
 
 /** Suggested key range for a song, honouring any manual pin. */
 fun SongEntity.preferredRange() =

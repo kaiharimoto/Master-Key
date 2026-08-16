@@ -11,11 +11,5 @@ class MasterKeyApp : Application() {
     override fun onCreate() {
         super.onCreate()
         graph = AppGraph(this)
-        instance = this
-    }
-
-    companion object {
-        lateinit var instance: MasterKeyApp
-            private set
     }
 }

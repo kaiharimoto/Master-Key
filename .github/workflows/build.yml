@@ -29,10 +29,31 @@ jobs:
       # is pinned in audio/build.gradle.kts because the image default is 27
       # while AGP 9.3 expects 28.x.
       - name: Unit tests
-        run: ./gradlew :core:test --no-daemon
+        run: ./gradlew :core:test :app:testDebugUnitTest --no-daemon
 
       - name: Assemble release APK
         run: ./gradlew :app:assembleRelease --no-daemon
+
+      # This is the check that would have caught the v1.0.1 crash before release.
+      # A column was added to an entity without bumping the database version, so
+      # Room threw on first query — at startup, on every launch, with the in-app
+      # updater unreachable behind the crash. The build regenerates the schema
+      # JSON; if it no longer matches what is committed, the schema moved and the
+      # version/migration did not follow it.
+      - name: Room schema must match what is committed
+        run: |
+          if ! git diff --quiet -- app/schemas; then
+            echo "::error::The Room schema changed but the exported JSON was not committed."
+            echo "Bump the database version, add a migration, and commit app/schemas."
+            git --no-pager diff -- app/schemas
+            exit 1
+          fi
+          if [ -n "$(git ls-files --others --exclude-standard -- app/schemas)" ]; then
+            echo "::error::A new Room schema version was generated but not committed."
+            git ls-files --others --exclude-standard -- app/schemas
+            exit 1
+          fi
+          echo "Room schema matches app/schemas."
 
       - name: Verify signature and 16 KB alignment
         run: |

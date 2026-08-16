@@ -5,6 +5,14 @@ plugins {
     alias(libs.plugins.kotlin.compose)
     alias(libs.plugins.kotlin.serialization)
     alias(libs.plugins.ksp)
+    alias(libs.plugins.room)
+}
+
+// Exported schemas are committed. CI fails if the generated JSON differs from
+// what is checked in, which is exactly the mistake that broke v1.0.1: a column
+// was added without bumping the database version.
+room {
+    schemaDirectory("$projectDir/schemas")
 }
 
 // Version derives from the git tag via a single formula that is mirrored exactly
@@ -125,7 +133,6 @@ dependencies {
     implementation(libs.room.ktx)
     ksp(libs.room.compiler)
 
-    implementation(libs.datastore.preferences)
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.kotlinx.serialization.json)
     implementation(libs.okhttp)

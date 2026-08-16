@@ -1,5 +1,6 @@
 plugins {
     alias(libs.plugins.kotlin.jvm)
+    alias(libs.plugins.kotlin.serialization)
 }
 
 // :core is deliberately a pure-JVM module with no Android dependency.
@@ -24,6 +25,7 @@ kotlin {
 dependencies {
     api(libs.ktmidi)
     implementation(libs.kotlinx.coroutines.core)
+    api(libs.kotlinx.serialization.json)
 
     testImplementation(libs.junit)
     testImplementation(libs.truth)

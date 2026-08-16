@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Auto Backup rules for API 31+ (android:dataExtractionRules).
+
+  Only the song folders are backed up. Naming an <include> makes everything else
+  excluded by definition, so the database, its WAL sidecars and the cache are all
+  left out without needing to be listed.
+
+  Excluding the database is the point. Restoring one written by a different app
+  version reproduces the exact schema-mismatch crash that broke v1.0.1 — on a
+  device that never ran that version. The index costs nothing to lose: every song
+  folder carries a song.json manifest, so the library rebuilds itself from the
+  restored files on first launch.
+-->
+<data-extraction-rules>
+    <cloud-backup>
+        <include domain="file" path="library" />
+    </cloud-backup>
+
+    <device-transfer>
+        <include domain="file" path="library" />
+    </device-transfer>
+</data-extraction-rules>

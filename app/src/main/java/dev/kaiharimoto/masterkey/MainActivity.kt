@@ -29,10 +29,10 @@ class MainActivity : ComponentActivity() {
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
         // Mandatory from targetSdk 35 onwards — there is no opt-out, so insets are
         // consumed explicitly by each screen rather than papered over.
         enableEdgeToEdge()
-        super.onCreate(savedInstanceState)
         askForNotificationPermission()
 
         setContent {

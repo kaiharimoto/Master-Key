@@ -23,6 +23,8 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 
 data class PlayerUiState(
@@ -92,12 +94,25 @@ class PlayerViewModel(
                     countingIn = playback.countingIn,
                     currentBar = _state.value.model?.barNumberAt(playback.positionTick) ?: 1,
                 )
-                if (playback.isPlaying) {
-                    PlaybackService.start(getApplication(), _state.value.song?.title.orEmpty())
-                } else {
-                    PlaybackService.stop(getApplication())
-                }
             }
+        }
+        // Driven by transitions, not by every emission. The engine rewrites
+        // positionTick every 50 ms, so collecting the whole state here fired
+        // ~20 startForegroundService() calls per second while playing.
+        viewModelScope.launch {
+            engine.state
+                .map { it.isPlaying }
+                .distinctUntilChanged()
+                .collect { playing ->
+                    if (playing) {
+                        PlaybackService.start(
+                            getApplication(),
+                            _state.value.song?.title.orEmpty(),
+                        )
+                    } else {
+                        PlaybackService.stop(getApplication())
+                    }
+                }
         }
         // Adaptive key range. Checked a few times a second rather than per frame:
         // the range only changes at section boundaries, and the highway animates

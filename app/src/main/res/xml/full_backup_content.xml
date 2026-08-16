@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Auto Backup rules for API 30 and below (android:fullBackupContent).
+  Same intent as backup_rules.xml: back up the music, never the database index.
+  The lone <include> is what excludes everything else.
+-->
+<full-backup-content>
+    <include domain="file" path="library" />
+</full-backup-content>
