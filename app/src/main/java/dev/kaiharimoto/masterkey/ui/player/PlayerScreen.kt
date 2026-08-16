@@ -310,6 +310,27 @@ private fun ScaffoldMenu(state: PlayerUiState, viewModel: PlayerViewModel) {
             DropdownMenuItem(
                 text = {
                     Text(
+                        if (state.countInBars > 0) {
+                            "Count-in: one bar"
+                        } else {
+                            "Count-in: off"
+                        },
+                    )
+                },
+                onClick = {
+                    viewModel.toggleCountIn()
+                    expanded = false
+                },
+                trailingIcon = {
+                    if (state.countInBars > 0) {
+                        Icon(Icons.Default.PlayArrow, contentDescription = null)
+                    }
+                },
+            )
+
+            DropdownMenuItem(
+                text = {
+                    Text(
                         if (state.settings.colorMode == ColorMode.BY_HAND) {
                             "Colour by pitch instead"
                         } else {

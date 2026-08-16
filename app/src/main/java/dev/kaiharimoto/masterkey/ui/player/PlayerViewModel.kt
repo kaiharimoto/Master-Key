@@ -39,6 +39,8 @@ data class PlayerUiState(
     val rightHandMuted: Boolean = false,
     val leftHandMuted: Boolean = false,
     val metronomeEnabled: Boolean = false,
+    val countInBars: Int = 1,
+    val countingIn: Boolean = false,
     val showScore: Boolean = true,
     val hasScore: Boolean = false,
     val scoreDocument: ScoreDocument? = null,
@@ -86,6 +88,8 @@ class PlayerViewModel(
                     rightHandMuted = playback.rightHandMuted,
                     leftHandMuted = playback.leftHandMuted,
                     metronomeEnabled = playback.metronomeEnabled,
+                    countInBars = playback.countInBars,
+                    countingIn = playback.countingIn,
                     currentBar = _state.value.model?.barNumberAt(playback.positionTick) ?: 1,
                 )
                 if (playback.isPlaying) {
@@ -159,6 +163,7 @@ class PlayerViewModel(
         engine.setHandMuted(Hand.RIGHT, song.rightHandMuted)
         engine.setHandMuted(Hand.LEFT, song.leftHandMuted)
         engine.setMetronomeEnabled(song.metronomeEnabled)
+        engine.setCountInBars(song.countInBars)
 
         _state.value = PlayerUiState(
             loading = false,
@@ -172,6 +177,7 @@ class PlayerViewModel(
             rightHandMuted = song.rightHandMuted,
             leftHandMuted = song.leftHandMuted,
             metronomeEnabled = song.metronomeEnabled,
+            countInBars = song.countInBars,
             showScore = song.showScore && song.scoreFileName != null,
             hasScore = song.scoreFileName != null,
             scoreDocument = score,
@@ -257,6 +263,12 @@ class PlayerViewModel(
         val enabled = !_state.value.metronomeEnabled
         engine.setMetronomeEnabled(enabled)
         persist { it.copy(metronomeEnabled = enabled) }
+    }
+
+    fun toggleCountIn() {
+        val bars = if (_state.value.countInBars > 0) 0 else 1
+        engine.setCountInBars(bars)
+        persist { it.copy(countInBars = bars) }
     }
 
     fun setScaffoldLevel(level: ScaffoldLevel) {

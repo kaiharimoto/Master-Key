@@ -26,6 +26,10 @@ data class PlaybackState(
     val rightHandMuted: Boolean = false,
     val leftHandMuted: Boolean = false,
     val metronomeEnabled: Boolean = false,
+    /** Bars of clicks before the music starts. 0 disables it. */
+    val countInBars: Int = 1,
+    /** True while the count-in is running and no notes have sounded yet. */
+    val countingIn: Boolean = false,
     val isReady: Boolean = false,
 )
 
@@ -77,6 +81,9 @@ class PlaybackEngine(private val context: Context) {
     private var anchorTick = 0L
     private var tempoScale = 1.0f
 
+    /** Frame at which the music actually begins; earlier frames are count-in. */
+    private var countInUntilFrame = 0L
+
     suspend fun initialise(soundFontAsset: String = DEFAULT_SOUND_FONT): Boolean =
         withContext(engineDispatcher) {
             if (synth.isCreated) return@withContext true
@@ -101,13 +108,59 @@ class PlaybackEngine(private val context: Context) {
     fun play() {
         scope.launch {
             if (!synth.isCreated || piece.notes.isEmpty()) return@launch
-            // Re-anchor so the mapping starts from wherever we are now.
-            anchorFrame = synth.transportFrames()
-            anchorTick = _state.value.positionTick
-            applyHandVolumes()
-            synth.setPlaying(true)
-            _state.value = _state.value.copy(isPlaying = true)
-            startScheduler()
+            startPlaying(withCountIn = true)
+        }
+    }
+
+    /**
+     * Starts the transport, optionally after a bar of clicks.
+     *
+     * The count-in is implemented by anchoring the tick-to-frame mapping ahead of
+     * the current frame. Every note then lands that much later automatically, and
+     * the gap is filled with metronome clicks — no separate scheduling path, and
+     * nothing to keep in sync with the music that follows.
+     */
+    private fun startPlaying(withCountIn: Boolean) {
+        val bars = if (withCountIn) _state.value.countInBars else 0
+        val countInFrames = if (bars > 0) countInFrames(bars) else 0L
+
+        anchorFrame = synth.transportFrames() + countInFrames
+        anchorTick = _state.value.positionTick
+        countInUntilFrame = anchorFrame
+
+        applyHandVolumes()
+        if (countInFrames > 0) scheduleCountIn(bars, anchorFrame - countInFrames)
+
+        synth.setPlaying(true)
+        _state.value = _state.value.copy(isPlaying = true, countingIn = countInFrames > 0)
+        startScheduler()
+    }
+
+    private fun countInFrames(bars: Int): Long {
+        val signature = piece.timeSignatureAt(anchorTickOrPosition())
+        val ticksPerBar = signature.ticksPerBar(piece.tempoMap.ticksPerQuarter).coerceAtLeast(1L)
+        val startTick = _state.value.positionTick
+        val micros = piece.tempoMap.tickToMicros(startTick + ticksPerBar * bars) -
+            piece.tempoMap.tickToMicros(startTick)
+        return ((micros / tempoScale) * sampleRate / 1_000_000.0).roundToLong()
+    }
+
+    private fun anchorTickOrPosition(): Long = _state.value.positionTick
+
+    private fun scheduleCountIn(bars: Int, fromFrame: Long) {
+        val signature = piece.timeSignatureAt(_state.value.positionTick)
+        val beats = signature.numerator * bars
+        if (beats <= 0) return
+        val span = anchorFrame - fromFrame
+        val perBeat = span / beats
+        for (beat in 0 until beats) {
+            synth.scheduleMetronome(
+                frame = fromFrame + perBeat * beat,
+                accent = beat % signature.numerator == 0,
+                // A count-in has to be audible over a real piano, so it is
+                // deliberately louder than the running metronome.
+                gain = 0.5f,
+            )
         }
     }
 
@@ -133,13 +186,9 @@ class PlaybackEngine(private val context: Context) {
             if (wasPlaying) stopInternal()
             seekInternal(tick.coerceIn(0L, piece.endTick))
             _state.value = _state.value.copy(positionTick = tick.coerceIn(0L, piece.endTick))
-            if (wasPlaying) {
-                anchorFrame = synth.transportFrames()
-                anchorTick = _state.value.positionTick
-                synth.setPlaying(true)
-                _state.value = _state.value.copy(isPlaying = true)
-                startScheduler()
-            }
+            // No count-in when scrubbing: a click burst on every drag of the
+            // playhead would be maddening.
+            if (wasPlaying) startPlaying(withCountIn = false)
         }
     }
 
@@ -159,13 +208,7 @@ class PlaybackEngine(private val context: Context) {
             tempoScale = clamped
             seekInternal(tick)
             _state.value = _state.value.copy(tempoScale = clamped, positionTick = tick)
-            if (wasPlaying) {
-                anchorFrame = synth.transportFrames()
-                anchorTick = tick
-                synth.setPlaying(true)
-                _state.value = _state.value.copy(isPlaying = true)
-                startScheduler()
-            }
+            if (wasPlaying) startPlaying(withCountIn = false)
         }
     }
 
@@ -199,7 +242,15 @@ class PlaybackEngine(private val context: Context) {
      */
     fun positionTickNow(): Long {
         if (!_state.value.isPlaying) return _state.value.positionTick
-        return tickAtFrame(synth.transportFrames()).coerceIn(0L, piece.endTick)
+        val frame = synth.transportFrames()
+        // During the count-in the playhead holds still. Letting it run backwards
+        // from before the first note would scroll the highway the wrong way.
+        if (frame < countInUntilFrame) return anchorTick
+        return tickAtFrame(frame).coerceIn(0L, piece.endTick)
+    }
+
+    fun setCountInBars(bars: Int) {
+        scope.launch { _state.value = _state.value.copy(countInBars = bars.coerceIn(0, 2)) }
     }
 
     fun release() {
@@ -224,12 +275,19 @@ class PlaybackEngine(private val context: Context) {
         val nowTick = currentTick()
         val loop = _state.value.loop
 
+        if (_state.value.countingIn && synth.transportFrames() >= countInUntilFrame) {
+            _state.value = _state.value.copy(countingIn = false)
+        }
+
         if (loop != null && nowTick >= loop.endTick) {
             // Jump back without stopping the stream, so the loop is seamless.
             synth.allNotesOff(synth.transportFrames())
             seekInternal(loop.startTick)
             anchorFrame = synth.transportFrames()
             anchorTick = loop.startTick
+            // No count-in on a loop wrap — the whole point is that it repeats
+            // without a gap.
+            countInUntilFrame = anchorFrame
             _state.value = _state.value.copy(positionTick = loop.startTick)
             return
         }
@@ -315,8 +373,11 @@ class PlaybackEngine(private val context: Context) {
         )
     }
 
-    private fun currentTick(): Long =
-        tickAtFrame(synth.transportFrames()).coerceIn(0L, piece.endTick)
+    private fun currentTick(): Long {
+        val frame = synth.transportFrames()
+        if (frame < countInUntilFrame) return anchorTick
+        return tickAtFrame(frame).coerceIn(0L, piece.endTick)
+    }
 
     private fun lookaheadTicks(): Long {
         val micros = LOOKAHEAD_MS * 1000L * tempoScale

@@ -47,6 +47,7 @@ data class SongEntity(
     @ColumnInfo(defaultValue = "0") val rightHandMuted: Boolean = false,
     @ColumnInfo(defaultValue = "0") val leftHandMuted: Boolean = false,
     @ColumnInfo(defaultValue = "0") val metronomeEnabled: Boolean = false,
+    @ColumnInfo(defaultValue = "1") val countInBars: Int = 1,
     @ColumnInfo(defaultValue = "1") val showScore: Boolean = true,
     @ColumnInfo(defaultValue = "8.0") val lookAheadBeats: Float = 8f,
 
