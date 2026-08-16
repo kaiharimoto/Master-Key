@@ -35,6 +35,15 @@ android {
         versionCode = appVersionCode
         versionName = appVersionName
 
+        // One ABI, one release asset. The in-app updater depends on there being
+        // exactly one APK to download, and ABI splits would additionally force
+        // per-ABI versionCodes, making "is this newer than what I'm running?"
+        // ambiguous. Every tablet from the last several years is arm64, and
+        // Android 15+ devices are 64-bit only.
+        ndk {
+            abiFilters += "arm64-v8a"
+        }
+
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
@@ -104,6 +113,7 @@ dependencies {
     implementation(libs.compose.ui.tooling.preview)
     debugImplementation(libs.compose.ui.tooling)
 
+    implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.activity.compose)
     implementation(libs.androidx.lifecycle.runtime.compose)
     implementation(libs.androidx.lifecycle.viewmodel.compose)

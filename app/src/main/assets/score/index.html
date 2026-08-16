@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Score</title>
+<style>
+  :root {
+    --bg: #0d0f14;
+    --ink: #e3e6ec;
+    --dim: rgba(227, 230, 236, 0.28);
+    --right: #ffb020;
+    --left: #2ed3c6;
+    --measure: rgba(255, 176, 32, 0.10);
+    --landmark: rgba(224, 87, 75, 0.55);
+  }
+
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: var(--bg);
+    color: var(--ink);
+    overflow: hidden;
+    -webkit-user-select: none;
+    user-select: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  #viewport {
+    position: absolute;
+    inset: 0;
+    overflow: hidden;
+  }
+
+  #page { transition: transform 180ms ease-out; }
+
+  /* Verovio emits plain SVG with black ink; recolour rather than using the
+     WebView's force-dark, which mangles SVG paths. */
+  #page svg { width: 100%; height: auto; display: block; }
+  #page svg * { fill: var(--ink); stroke: var(--ink); }
+  #page svg .staff path,
+  #page svg .barLine path,
+  #page svg .ledgerLines path { stroke: rgba(227,230,236,0.55); }
+
+  /* Past and future are dimmed so the eye lands on the present bar. Beginners
+     lose their place at the *bar* level, not the note level, which is why the
+     whole measure is highlighted rather than a thin cursor line. */
+  #page svg .measure { opacity: 0.34; transition: opacity 140ms linear; }
+  #page svg .measure.mk-near { opacity: 0.62; }
+  #page svg .measure.mk-current { opacity: 1; }
+
+  #page svg .note.mk-right *,
+  #page svg .chord.mk-right * { fill: var(--right); stroke: var(--right); }
+  #page svg .note.mk-left *,
+  #page svg .chord.mk-left * { fill: var(--left); stroke: var(--left); }
+
+  #page svg .note.mk-sounding * {
+    fill: #ffffff;
+    stroke: #ffffff;
+  }
+
+  #measureBox {
+    position: absolute;
+    pointer-events: none;
+    background: var(--measure);
+    border-radius: 6px;
+    transition: all 160ms ease-out;
+    opacity: 0;
+  }
+
+  #status {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font: 14px system-ui, -apple-system, sans-serif;
+    color: rgba(227,230,236,0.6);
+    text-align: center;
+    padding: 24px;
+    box-sizing: border-box;
+  }
+  #status.hidden { display: none; }
+</style>
+</head>
+<body>
+  <div id="viewport">
+    <div id="measureBox"></div>
+    <div id="page"></div>
+  </div>
+  <div id="status">Loading engraver…</div>
+  <script src="verovio-toolkit-wasm.js"></script>
+  <script src="score.js"></script>
+</body>
+</html>

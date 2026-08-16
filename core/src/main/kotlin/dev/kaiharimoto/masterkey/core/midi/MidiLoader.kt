@@ -216,6 +216,26 @@ object Pitch {
 
     fun isBlack(pitch: Int): Boolean = !isWhite(pitch)
 
+    /** White keys strictly below [pitch], counted from MIDI 0. C4 (60) is 35. */
+    fun whiteIndex(pitch: Int): Int {
+        val octave = Math.floorDiv(pitch, 12)
+        val within = Math.floorMod(pitch, 12)
+        var count = 0
+        for (i in 0 until within) if (WHITE_PITCH_CLASSES[i]) count++
+        return octave * 7 + count
+    }
+
+    /**
+     * Horizontal position of a key in white-key units, measured from MIDI 0.
+     *
+     * White keys sit at the middle of their slot; black keys sit exactly on the
+     * seam between the two whites they lie between. Expressing this as a single
+     * continuous number is what lets the view pan smoothly between key ranges —
+     * the endpoints can be animated as floats instead of jumping key to key.
+     */
+    fun whitePosition(pitch: Int): Float =
+        whiteIndex(pitch) + if (isWhite(pitch)) 0.5f else 0.0f
+
     /** Scientific pitch notation octave, where middle C (60) is C4. */
     fun octave(pitch: Int): Int = pitch / 12 - 1
 

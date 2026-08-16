@@ -44,6 +44,14 @@
             android:exported="false"
             android:foregroundServiceType="mediaPlayback" />
 
+        <receiver
+            android:name=".update.InstallResultReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="dev.kaiharimoto.masterkey.INSTALL_RESULT" />
+            </intent-filter>
+        </receiver>
+
     </application>
 
 </manifest>

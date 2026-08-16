@@ -1,4 +1,38 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">Master Key</string>
+    <string name="practising">Practising</string>
+    <string name="playback_channel">Playback</string>
+
+    <!-- Library -->
+    <string name="library_title">Your songs</string>
+    <string name="add_song">Add song</string>
+    <string name="library_empty_title">No songs yet</string>
+    <string name="library_empty_body">Add a MIDI file to get started. Select its MusicXML score at the same time and they\'ll be paired automatically.</string>
+    <string name="attach_score">Add sheet music</string>
+    <string name="delete_song">Delete</string>
+    <string name="midi_only">MIDI only</string>
+    <string name="midi_and_score">MIDI + score</string>
+
+    <!-- Player -->
+    <string name="play">Play</string>
+    <string name="pause">Pause</string>
+    <string name="restart">Restart</string>
+    <string name="tempo">Tempo</string>
+    <string name="loop">Loop</string>
+    <string name="hands">Hands</string>
+    <string name="right_hand">Right</string>
+    <string name="left_hand">Left</string>
+    <string name="metronome">Metronome</string>
+    <string name="scaffolding">Reading aids</string>
+    <string name="show_score">Sheet music</string>
+    <string name="no_score_linked">No sheet music linked to this song</string>
+
+    <!-- Updates -->
+    <string name="check_for_updates">Check for updates</string>
+    <string name="update_available">Update available</string>
+    <string name="update_now">Update</string>
+    <string name="update_later">Later</string>
+    <string name="up_to_date">You\'re on the latest version</string>
+    <string name="settings">Settings</string>
 </resources>
