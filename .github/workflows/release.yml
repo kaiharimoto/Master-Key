@@ -74,6 +74,20 @@ jobs:
       - name: Unit tests
         run: ./gradlew :core:test :app:testDebugUnitTest --no-daemon
 
+      # The same two host suites the Build workflow runs. Pushes go straight to
+      # main here, so the release is the last gate before an APK reaches the
+      # tablet — it should not be a weaker one than the build.
+      - name: Scheduler queue tests
+        run: |
+          c++ -std=c++17 -Wall -Wextra -o "$RUNNER_TEMP/event_queue_test" \
+            audio/src/main/cpp/test/event_queue_test.cpp
+          "$RUNNER_TEMP/event_queue_test"
+
+      - name: Score pane tests
+        run: |
+          npm --prefix tools/score-test ci --no-audit --no-fund
+          node tools/score-test/scorepane.test.mjs
+
       # No signing secrets: the release keystore is committed on purpose.
       # See KEYS.md for why, and for why it must never be regenerated.
       - name: Build signed release APK
