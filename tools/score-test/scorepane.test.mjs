@@ -77,6 +77,18 @@ const PANE_HEIGHT = 520;
 Object.defineProperty(doc.getElementById('viewport'), 'clientWidth', { value: PANE_WIDTH });
 Object.defineProperty(doc.getElementById('viewport'), 'clientHeight', { value: PANE_HEIGHT });
 
+// score.js checks that what it engraved actually has a laid-out box, because
+// "engraved fine, painted nothing" is a real failure and used to be invisible.
+// jsdom measures everything as zero, so without this the check reads every run
+// as that failure. What the *pixels* look like is the render test's job; this
+// suite is about the DOM and the timemap.
+win.Element.prototype.getBoundingClientRect = function () {
+  const isViewport = this.id === 'viewport';
+  const width = PANE_WIDTH;
+  const height = isViewport ? PANE_HEIGHT : 200;
+  return { x: 0, y: 0, top: 0, left: 0, right: width, bottom: height, width, height };
+};
+
 const events = [];
 win.MasterKey = { onScoreEvent: (payload) => events.push(JSON.parse(payload)) };
 

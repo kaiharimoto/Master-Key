@@ -63,9 +63,11 @@ pre-merge gate, so the local run *is* the gate.
 ./gradlew :core:test :app:testDebugUnitTest
 ./gradlew :app:assembleRelease
 
-# Two suites that cannot be reached from a JVM test:
+# Three suites that cannot be reached from a JVM test:
 c++ -std=c++17 -Wall -Wextra -o /tmp/eqt audio/src/main/cpp/test/event_queue_test.cpp && /tmp/eqt
-npm --prefix tools/score-test ci && node tools/score-test/scorepane.test.mjs
+npm --prefix tools/score-test ci
+node tools/score-test/scorepane.test.mjs   # DOM and timemap, under jsdom
+node tools/score-test/render.test.mjs      # actual pixels, under headless Chromium
 ```
 
 The release workflow re-runs the JVM tests and the signed build before it
@@ -94,7 +96,12 @@ that the ring delivers events in production order, which is not musical order �
 the callback sorts them through an `EventTimeline` before applying them. Skipping
 that step makes chords play a single note.
 
-**The score pane swallows its own errors.** `score.js` catches everything and
-replaces itself with "this score could not be read", so a total failure looks
-exactly like a feature that was never built. Run the jsdom suite after touching
-anything in `app/src/main/assets/score/`.
+**The score pane fails invisibly, and jsdom cannot see it.** `score.js` catches
+everything and replaces itself with a polite message, so a total failure looks
+exactly like a feature that was never built. Worse, the pane can engrave
+perfectly and still show nothing readable — too small, scrolled out of view, or
+dimmed into the background — and the jsdom suite passes throughout, because
+jsdom has no layout and paints no pixels. Two releases shipped blank that way.
+**After touching anything in `app/src/main/assets/score/`, run `render.test.mjs`
+too, and look at the screenshot** (`--save out.png`); it is the only check that
+sees what the tablet sees.

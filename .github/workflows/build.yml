@@ -48,6 +48,15 @@ jobs:
           npm --prefix tools/score-test ci --no-audit --no-fund
           node tools/score-test/scorepane.test.mjs
 
+      # jsdom builds a DOM but paints nothing, so it cannot tell "engraved
+      # correctly" from "visible" — and it passed through two releases where the
+      # pane on the tablet was blank. This one drives headless Chromium and
+      # measures the pixels.
+      - name: Score pane renders
+        run: |
+          npx --prefix tools/score-test playwright install --with-deps chromium
+          node tools/score-test/render.test.mjs
+
       - name: Assemble release APK
         run: ./gradlew :app:assembleRelease --no-daemon
 

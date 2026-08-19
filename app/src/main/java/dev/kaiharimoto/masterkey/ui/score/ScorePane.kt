@@ -69,6 +69,8 @@ fun ScorePane(
     scaffold: ScaffoldSettings,
     positionProvider: () -> Long,
     modifier: Modifier = Modifier,
+    /** Engraving size as a percentage; see AppSettings.scoreZoom. */
+    zoom: Int = 70,
     /** Why there is nothing to engrave, when the file could not be read at all. */
     loadError: String? = null,
     onEvent: (ScoreEvent) -> Unit = {},
@@ -180,6 +182,14 @@ fun ScorePane(
             status = ScoreStatus.Broken(
                 "The engraver didn't start. Reopening the song usually clears it.",
             )
+        }
+    }
+
+    // Engraving size. A relayout, so it waits until the score is actually up.
+    LaunchedEffect(zoom, bridge) {
+        bridge.awaitLoaded()
+        webView.post {
+            webView.evaluateJavascript("window.MasterKeyScore.setZoom($zoom);", null)
         }
     }
 

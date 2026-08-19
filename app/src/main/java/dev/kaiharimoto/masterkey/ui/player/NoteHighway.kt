@@ -27,6 +27,7 @@ import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import dev.kaiharimoto.masterkey.core.keyboard.KeyRange
+import dev.kaiharimoto.masterkey.core.keyboard.PianoProportions
 import dev.kaiharimoto.masterkey.core.midi.Pitch
 import dev.kaiharimoto.masterkey.core.model.Hand
 import dev.kaiharimoto.masterkey.core.model.Note
@@ -96,17 +97,27 @@ fun NoteHighway(
         }
     }
 
-    val keyboardHeightPx = with(density) { KEYBOARD_HEIGHT.toPx() }
+    val minKeyboardPx = with(density) { KEYBOARD_MIN_DEPTH.toPx() }
+    val maxKeyboardPx = with(density) { KEYBOARD_MAX_DEPTH.toPx() }
     val cornerPx = with(density) { 3.dp.toPx() }
+
+    // Depth follows key width, so it has to be recomputed whenever the visible
+    // range changes — including mid-animation while the view pans between
+    // sections. Cheap: two multiplies against values that are already to hand.
+    fun keyboardDepth(containerWidth: Float, containerHeight: Float): Float =
+        HighwayLayout(leftWhite.value, visibleWhite.value, containerWidth)
+            .keyboardDepth(minKeyboardPx, minOf(maxKeyboardPx, containerHeight * KEYBOARD_MAX_SHARE))
 
     Canvas(
         modifier = modifier.pointerInput(model, onSeekToTick, onKeyTapped) {
             detectTapGestures { offset ->
+                val keyboardHeightPx = keyboardDepth(size.width.toFloat(), size.height.toFloat())
                 val keyLineY = size.height - keyboardHeightPx
                 if (offset.y >= keyLineY) {
                     onKeyTapped ?: return@detectTapGestures
                     val layout = HighwayLayout(leftWhite.value, visibleWhite.value, size.width.toFloat())
-                    val isBlackRow = offset.y < keyLineY + keyboardHeightPx * 0.62f
+                    val isBlackRow =
+                        offset.y < keyLineY + keyboardHeightPx * PianoProportions.BLACK_TO_WHITE_LENGTH
                     layout.pitchAt(offset.x, isBlackRow, range.low, range.high)
                         ?.let(onKeyTapped)
                 } else {
@@ -124,6 +135,7 @@ fun NoteHighway(
         val position = positionTicks.longValue
         val width = size.width
         val height = size.height
+        val keyboardHeightPx = keyboardDepth(width, height)
         val keyLineY = height - keyboardHeightPx
         if (keyLineY <= 0f || width <= 0f) return@Canvas
 
@@ -399,7 +411,7 @@ private fun DrawScope.drawKeyboard(
         drawRect(color, Offset(left, keyLineY), Size(width - 1f, keyboardHeight))
     }
 
-    val blackHeight = keyboardHeight * 0.62f
+    val blackHeight = keyboardHeight * PianoProportions.BLACK_TO_WHITE_LENGTH
     for (pitch in range.low..range.high) {
         if (!Pitch.isBlack(pitch)) continue
         if (!layout.isVisible(pitch)) continue
@@ -456,7 +468,16 @@ private class TextLayoutCache(private val measurer: TextMeasurer) {
         cache.getOrPut(text to style) { measurer.measure(text, style) }
 }
 
-private val KEYBOARD_HEIGHT = 96.dp
+/**
+ * Bounds on how deep the drawn keyboard gets.
+ *
+ * The floor keeps narrow keys from collapsing into a strip you cannot aim at;
+ * the ceiling — and the share of the pane — keep a wide-key layout from eating
+ * the runway the notes need to fall down and be read on the way.
+ */
+private val KEYBOARD_MIN_DEPTH = 78.dp
+private val KEYBOARD_MAX_DEPTH = 168.dp
+private const val KEYBOARD_MAX_SHARE = 0.34f
 
 private val NOTE_LABEL_DARK = TextStyle(
     color = Color(0xFF14161C),

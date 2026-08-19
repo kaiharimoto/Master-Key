@@ -52,23 +52,26 @@
   }
 
   /**
-   * Engraving scale, as a percentage.
+   * Engraving scale, as a percentage. The reader's zoom control.
    *
-   * This same number has to divide the page dimensions below, because Verovio
-   * emits an SVG of `pageWidth * SCALE / 100` pixels. Passing the pane's pixel
-   * width straight through as pageWidth (i.e. dividing by 100 instead of by the
-   * scale) engraves the page at 40% of the pane and breaks the piece across two
-   * and a half times as many pages as it needs.
+   * Two things depend on it, and they pull in opposite directions. The SVG comes
+   * out `pageWidth * scale / 100` pixels wide, so pageWidth must be divided by
+   * the scale for the engraving to fill the pane — dividing by 100 instead put
+   * the notation at 40% size in the corner. And because the staff is a fixed
+   * size in the page's own units, a smaller page fits fewer bars per line and
+   * therefore draws each of them bigger. So this is the whole zoom mechanism:
+   * raise it for larger notes and fewer bars per system, lower it for more music
+   * at a smaller size.
    */
-  var SCALE = 40;
+  var scale = 70;
 
   function options() {
     return {
       // One page per screenful, laid out to the viewport, rather than one huge
       // SVG — this is what keeps rendering cheap on a tablet.
-      pageWidth: Math.max(600, Math.round(viewportEl.clientWidth * 100 / SCALE)),
-      pageHeight: Math.max(400, Math.round(viewportEl.clientHeight * 100 / SCALE)),
-      scale: SCALE,
+      pageWidth: Math.max(600, Math.round(viewportEl.clientWidth * 100 / scale)),
+      pageHeight: Math.max(400, Math.round(viewportEl.clientHeight * 100 / scale)),
+      scale: scale,
       adjustPageHeight: true,
       breaks: 'auto',
       // Times is not on Android; Leipzig ships with Verovio.
@@ -160,15 +163,35 @@
         // renders the entire score at the dimmed level.
         updateMeasure(measureAt[0]);
 
+        // Measured, not assumed. Everything above can succeed while the page
+        // still paints nothing — an engraving stranded outside the viewport, or
+        // one the WebView declined to draw — and from Kotlin the two are
+        // indistinguishable. Reporting the geometry makes them distinguishable.
+        var drawn = measureDrawn();
         post({
           type: 'loaded',
           pages: pageCount,
           events: timemap.length,
+          bars: drawn.bars,
+          width: drawn.width,
+          height: drawn.height,
           // Verovio expands repeats for timemap output by default, so the score
           // timeline is already in performance order.
           lastQstamp: timemap.length ? timemap[timemap.length - 1].qstamp : 0
         });
-        status(timemap.length ? '' : 'This score has no playable notes.');
+
+        if (!timemap.length) {
+          status('This score has no playable notes.');
+        } else if (drawn.width < 1 || drawn.height < 1 || drawn.bars < 1) {
+          status('');
+          post({
+            type: 'error',
+            message: 'The score engraved but did not draw (' +
+              drawn.bars + ' bars, ' + drawn.width + '×' + drawn.height + ').'
+          });
+        } else {
+          status('');
+        }
       } catch (e) {
         status('This score could not be read.');
         post({ type: 'error', message: String(e) });
@@ -206,6 +229,19 @@
 
     setPage: function (page) {
       renderPage(page);
+    },
+
+    /**
+     * Sets the engraving size, as a percentage.
+     *
+     * Needs a full relayout — it changes how many bars fit on a line, not just
+     * how big they are drawn — so it is a deliberate control, not a gesture.
+     */
+    setZoom: function (percent) {
+      var next = Math.max(40, Math.min(140, Math.round(percent) || 70));
+      if (next === scale) return;
+      scale = next;
+      window.MasterKeyScore.relayout();
     },
 
     /**
@@ -259,6 +295,18 @@
       if (timemap[i].measureOn) current = timemap[i].measureOn;
       measureAt[i] = current;
     }
+  }
+
+  /** What actually made it onto the page, in real laid-out pixels. */
+  function measureDrawn() {
+    var svg = pageEl.querySelector('svg');
+    if (!svg) return { bars: 0, width: 0, height: 0 };
+    var rect = svg.getBoundingClientRect();
+    return {
+      bars: pageEl.querySelectorAll('.measure').length,
+      width: Math.round(rect.width),
+      height: Math.round(rect.height)
+    };
   }
 
   function accumulate(set, entry) {
@@ -373,16 +421,38 @@
     if (index + 1 < all.length) all[index + 1].classList.add('mk-near');
   }
 
+  /**
+   * Brings a bar into view, and otherwise leaves the page where it is.
+   *
+   * Deliberately not "centre the current bar": centring bar one pushes the top
+   * of the score a third of the way down an empty pane, and on a short pane it
+   * pushes it off the bottom altogether. Scrolling only when the target is
+   * actually outside the visible band keeps the score pinned to the top for as
+   * long as the music being played is up there.
+   *
+   * Driven by hand rather than through scrollIntoView, which is documented to
+   * behave inconsistently inside Android's WebView.
+   */
   function scrollToElement(el) {
-    // Drive the scroll ourselves rather than using scrollIntoView, which is
-    // documented to behave inconsistently inside Android's WebView.
     var rect = el.getBoundingClientRect();
     var viewRect = viewportEl.getBoundingClientRect();
-    var offset = rect.top - viewRect.top;
-    var target = offset - viewRect.height * 0.35;
-    if (Math.abs(target) < 24) return;
+    var margin = Math.min(48, viewRect.height * 0.12);
+    var above = rect.top - (viewRect.top + margin);
+    var below = rect.bottom - (viewRect.bottom - margin);
+
+    var shift;
+    if (above < 0) {
+      shift = above;              // scrolled off the top: bring it down
+    } else if (below > 0) {
+      shift = below;              // off the bottom: bring it up
+    } else {
+      return;                     // already visible; leave well alone
+    }
+    if (Math.abs(shift) < 8) return;
+
     var current = parseFloat(pageEl.dataset.offset || '0');
-    var next = current - target;
+    // Never leave a gap above the first system.
+    var next = Math.min(0, current - shift);
     pageEl.dataset.offset = String(next);
     pageEl.style.transform = 'translateY(' + next + 'px)';
   }

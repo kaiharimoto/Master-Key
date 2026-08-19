@@ -48,8 +48,13 @@ data class PlayerUiState(
     val countInEnabled: Boolean = false,
     val countingIn: Boolean = false,
     val showScore: Boolean = true,
+    val showHighway: Boolean = true,
     val hasScore: Boolean = false,
     val scorePlacement: ScorePlacement = ScorePlacement.TOP,
+    val scoreZoom: Int = AppSettings.DEFAULT_SCORE_ZOOM,
+    /** White keys to draw, or [AppSettings.KEYBOARD_AUTO] to fit the piece. */
+    val keyboardWhiteKeys: Int = AppSettings.KEYBOARD_AUTO,
+    val showViewerSettings: Boolean = false,
     val scoreDocument: ScoreDocument? = null,
     /** Raw MusicXML handed to the engraver. Null when it could not be read. */
     val scoreXml: String? = null,
@@ -77,6 +82,14 @@ class PlayerViewModel(
     val state: StateFlow<PlayerUiState> = _state.asStateFlow()
 
     private var piece: Piece = Piece.EMPTY
+
+    /**
+     * The range the music itself asks for, before the keyboard-size setting.
+     *
+     * Kept separate so changing the size re-widens from the piece rather than
+     * from the last widened result, which would ratchet outwards.
+     */
+    private var baseRange: KeyRange = KeyRange.FULL_PIANO
 
     /**
      * Read by the highway once per frame, in its draw phase.
@@ -144,6 +157,17 @@ class PlayerViewModel(
             }
         }
         viewModelScope.launch {
+            appSettings.scoreZoom.collect { _state.value = _state.value.copy(scoreZoom = it) }
+        }
+        viewModelScope.launch {
+            appSettings.showHighway.collect { _state.value = _state.value.copy(showHighway = it) }
+        }
+        viewModelScope.launch {
+            appSettings.keyboardWhiteKeys.collect {
+                _state.value = _state.value.copy(keyboardWhiteKeys = it, range = rangeFor(baseRange, it))
+            }
+        }
+        viewModelScope.launch {
             appSettings.countInEnabled.collect { enabled ->
                 engine.setCountInBars(if (enabled) 1 else 0)
                 _state.value = _state.value.copy(countInEnabled = enabled)
@@ -156,8 +180,10 @@ class PlayerViewModel(
             while (true) {
                 val sections = _state.value.sections
                 if (sections.size > 1) {
-                    val target = sections.rangeAt(engine.positionTickNow(), _state.value.range)
+                    val section = sections.rangeAt(positionTicks(), baseRange)
+                    val target = rangeFor(section, _state.value.keyboardWhiteKeys)
                     if (target != _state.value.range) {
+                        baseRange = section
                         _state.value = _state.value.copy(range = target)
                     }
                 }
@@ -213,6 +239,8 @@ class PlayerViewModel(
             null
         }
 
+        baseRange = pinned ?: sections.firstOrNull()?.range ?: KeyRangeSelector.forPiece(piece)
+
         engine.setTempoScale(song.tempoScale)
         engine.setHandMuted(Hand.RIGHT, song.rightHandMuted)
         engine.setHandMuted(Hand.LEFT, song.leftHandMuted)
@@ -223,8 +251,7 @@ class PlayerViewModel(
             loading = false,
             song = song,
             model = HighwayModel(piece),
-            range = pinned ?: sections.firstOrNull()?.range
-                ?: KeyRangeSelector.forPiece(piece),
+            range = rangeFor(baseRange, appSettings.keyboardWhiteKeys.value),
             sections = if (pinned != null) emptyList() else sections,
             settings = settings,
             tempoScale = song.tempoScale,
@@ -232,8 +259,11 @@ class PlayerViewModel(
             leftHandMuted = song.leftHandMuted,
             metronomeEnabled = song.metronomeEnabled,
             showScore = song.showScore && song.scoreFileName != null,
+            showHighway = appSettings.showHighway.value,
             hasScore = song.scoreFileName != null,
             scorePlacement = appSettings.scorePlacement.value,
+            scoreZoom = appSettings.scoreZoom.value,
+            keyboardWhiteKeys = appSettings.keyboardWhiteKeys.value,
             countInEnabled = appSettings.countInEnabled.value,
             scoreDocument = score,
             scoreXml = scoreXml?.getOrNull(),
@@ -371,6 +401,41 @@ class PlayerViewModel(
 
     fun moveScoreRight() = appSettings.setScorePlacement(_state.value.scorePlacement.movedRight())
 
+    /** Applies the keyboard-size setting to a range chosen from the music. */
+    private fun rangeFor(range: KeyRange, whiteKeys: Int): KeyRange =
+        if (whiteKeys == AppSettings.KEYBOARD_AUTO) range else KeyRangeSelector.widenTo(range, whiteKeys)
+
+    fun setScoreZoom(percent: Int) = appSettings.setScoreZoom(percent)
+
+    fun setKeyboardWhiteKeys(keys: Int) = appSettings.setKeyboardWhiteKeys(keys)
+
+    /**
+     * Shows or hides a pane, refusing to hide the last one.
+     *
+     * An empty player is not a view anyone wants; it just looks broken, which is
+     * a thing this screen has done enough of already.
+     */
+    fun setShowHighway(show: Boolean) {
+        if (!show && !(_state.value.showScore && _state.value.hasScore)) return
+        appSettings.setShowHighway(show)
+    }
+
+    fun setShowScore(show: Boolean) {
+        if (!show && !_state.value.showHighway) return
+        _state.value = _state.value.copy(showScore = show)
+        persist { it.copy(showScore = show) }
+    }
+
+    fun toggleViewerSettings() {
+        _state.value = _state.value.copy(showViewerSettings = !_state.value.showViewerSettings)
+    }
+
+    fun hideViewerSettings() {
+        if (_state.value.showViewerSettings) {
+            _state.value = _state.value.copy(showViewerSettings = false)
+        }
+    }
+
     fun toggleShortcuts() {
         _state.value = _state.value.copy(showShortcuts = !_state.value.showShortcuts)
     }
@@ -427,11 +492,9 @@ class PlayerViewModel(
         }
     }
 
-    fun toggleScore() {
-        val show = !_state.value.showScore
-        _state.value = _state.value.copy(showScore = show)
-        persist { it.copy(showScore = show) }
-    }
+    fun toggleScore() = setShowScore(!_state.value.showScore)
+
+    fun toggleHighway() = setShowHighway(!_state.value.showHighway)
 
     /** Loops the given inclusive bar range. */
     fun setLoopBars(startBar: Int, endBar: Int) {

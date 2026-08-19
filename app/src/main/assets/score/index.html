@@ -38,9 +38,11 @@
      WebView's force-dark, which mangles SVG paths. */
   #page svg { width: 100%; height: auto; display: block; }
   #page svg * { fill: var(--ink); stroke: var(--ink); }
+  /* Staff lines are already dimmed a second time by the measure opacity below,
+     so anything much under full strength here disappears on a dark screen. */
   #page svg .staff path,
   #page svg .barLine path,
-  #page svg .ledgerLines path { stroke: rgba(227,230,236,0.55); }
+  #page svg .ledgerLines path { stroke: rgba(227,230,236,0.8); }
 
   /* Past and future are dimmed so the eye lands on the present bar. Beginners
      lose their place at the *bar* level, not the note level, which is why the

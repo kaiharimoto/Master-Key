@@ -1,5 +1,6 @@
 package dev.kaiharimoto.masterkey.ui.player
 
+import dev.kaiharimoto.masterkey.core.keyboard.PianoProportions
 import dev.kaiharimoto.masterkey.core.midi.Pitch
 import dev.kaiharimoto.masterkey.core.model.Note
 import dev.kaiharimoto.masterkey.core.model.Piece
@@ -133,7 +134,20 @@ class HighwayLayout(
     val width: Float,
 ) {
     val whiteKeyWidth: Float = if (visibleWhiteKeys > 0f) width / visibleWhiteKeys else width
-    val blackKeyWidth: Float = whiteKeyWidth * 0.62f
+    val blackKeyWidth: Float = whiteKeyWidth * PianoProportions.BLACK_TO_WHITE_WIDTH
+
+    /**
+     * How deep to draw the keyboard, from how wide its keys came out.
+     *
+     * A real white key is 23.5 mm across and 150 mm long. Nothing near that
+     * proportion fits in a band along the bottom of a tablet, so this follows it
+     * as far as it can and then stops: wider keys get a deeper keyboard, but
+     * never past the ceiling, because everything given to the keyboard is taken
+     * from the runway the notes fall down. A fixed depth was the old behaviour
+     * and it is what made a two-octave piece look like a row of buttons.
+     */
+    fun keyboardDepth(minPx: Float, maxPx: Float): Float =
+        (whiteKeyWidth * PianoProportions.WHITE_KEY_ASPECT).coerceIn(minPx, maxPx)
 
     fun centerOf(pitch: Int): Float =
         (Pitch.whitePosition(pitch) - leftWhiteIndex) * whiteKeyWidth

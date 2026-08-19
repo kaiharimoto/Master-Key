@@ -54,8 +54,15 @@ data class RangeSection(
  */
 object KeyRangeSelector {
 
-    /** Roughly two octaves; below this the keys get comically wide. */
-    const val DEFAULT_MIN_WHITE_KEYS = 15
+    /**
+     * Roughly three octaves.
+     *
+     * Was two, which made a narrow study fill the screen with keys three times
+     * the width of real ones — the drawn keyboard stopped looking like a piano
+     * and started looking like a row of buttons. Three octaves keeps the shape
+     * recognisable while still being far wider than a piece that only uses two.
+     */
+    const val DEFAULT_MIN_WHITE_KEYS = 22
 
     /** Roughly five octaves; beyond this the keys get too thin to aim at. */
     const val DEFAULT_MAX_WHITE_KEYS = 36
@@ -197,6 +204,15 @@ object KeyRangeSelector {
         while (!Pitch.isWhite(high)) high--
         return KeyRange(low, high)
     }
+
+    /**
+     * Widens a range to show [whiteKeys] keys, for a chosen keyboard size.
+     *
+     * Never narrows: the music has to stay on screen whatever size was asked
+     * for, so a request smaller than the piece needs is simply ignored.
+     */
+    fun widenTo(range: KeyRange, whiteKeys: Int): KeyRange =
+        if (whiteKeys <= range.whiteKeyCount) range else padToMinimum(range, whiteKeys)
 
     /** Widens a narrow range symmetrically until it reaches [minWhiteKeys]. */
     internal fun padToMinimum(range: KeyRange, minWhiteKeys: Int): KeyRange {

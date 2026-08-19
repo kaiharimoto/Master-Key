@@ -107,10 +107,13 @@ val SHORTCUT_GROUPS: List<Pair<String, List<Shortcut>>> = listOf(
     ),
     "View" to listOf(
         Shortcut("S", "Show / hide sheet music"),
+        Shortcut("H", "Show / hide falling notes"),
         Shortcut("[ ]", "Move sheet music left / right"),
+        Shortcut("+ −", "Sheet music bigger / smaller"),
         Shortcut("A", "Cycle reading aids"),
+        Shortcut("V", "View settings"),
         Shortcut("I", "This list"),
-        Shortcut("Esc", "Close this list, or go back"),
+        Shortcut("Esc", "Close, or go back"),
     ),
 )
 

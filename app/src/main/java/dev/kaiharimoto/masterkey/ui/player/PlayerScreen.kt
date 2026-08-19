@@ -29,6 +29,7 @@ import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Repeat
 import androidx.compose.material.icons.filled.Replay
 import androidx.compose.material.icons.filled.Speed
+import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.filled.Timer
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material3.CircularProgressIndicator
@@ -126,8 +127,16 @@ private fun handleShortcut(
         return true
     }
 
-    // With the legend up, nothing else should fire — pressing a key to read what
-    // it does, and having it happen behind the overlay, is a nasty surprise.
+    // With something on top, nothing behind it should fire — pressing a key to
+    // read what it does, and having it happen out of sight, is a nasty surprise.
+    if (state.showViewerSettings) {
+        return when (event.keyCode) {
+            android.view.KeyEvent.KEYCODE_V,
+            android.view.KeyEvent.KEYCODE_ESCAPE,
+            -> once(viewModel::hideViewerSettings)
+            else -> true
+        }
+    }
     if (state.showShortcuts) {
         return when (event.keyCode) {
             android.view.KeyEvent.KEYCODE_I,
@@ -161,6 +170,16 @@ private fun handleShortcut(
         android.view.KeyEvent.KEYCODE_M -> once(viewModel::toggleMetronome)
         android.view.KeyEvent.KEYCODE_N -> once(viewModel::toggleCountIn)
         android.view.KeyEvent.KEYCODE_S -> once(viewModel::toggleScore)
+        android.view.KeyEvent.KEYCODE_H -> once(viewModel::toggleHighway)
+        android.view.KeyEvent.KEYCODE_V -> once(viewModel::toggleViewerSettings)
+        android.view.KeyEvent.KEYCODE_EQUALS,
+        android.view.KeyEvent.KEYCODE_PLUS,
+        -> {
+            viewModel.setScoreZoom(state.scoreZoom + SCORE_ZOOM_STEP); true
+        }
+        android.view.KeyEvent.KEYCODE_MINUS -> {
+            viewModel.setScoreZoom(state.scoreZoom - SCORE_ZOOM_STEP); true
+        }
         android.view.KeyEvent.KEYCODE_LEFT_BRACKET -> once(viewModel::moveScoreLeft)
         android.view.KeyEvent.KEYCODE_RIGHT_BRACKET -> once(viewModel::moveScoreRight)
         android.view.KeyEvent.KEYCODE_D -> once(viewModel::advanceTempoDrill)
@@ -177,6 +196,9 @@ private fun handleShortcut(
 
 /** 5% a press: fine enough to creep up on a passage, coarse enough to be felt. */
 private const val TEMPO_STEP = 0.05f
+
+/** Big enough that one press visibly changes how many bars fit on a line. */
+private const val SCORE_ZOOM_STEP = 10
 
 @Composable
 private fun ErrorState(message: String, onBack: () -> Unit) {
@@ -206,6 +228,8 @@ private fun PlayerContent(
     // are comfortable at once; in portrait the highway wants most of the height.
     var scoreWeight by remember { mutableFloatStateOf(0.42f) }
     val showScore = state.showScore && state.hasScore
+    val showHighway = state.showHighway || !showScore
+    val bothPanes = showScore && showHighway
     val placement = state.scorePlacement
 
     // movableContentOf, not plain lambdas: moving the score from above the
@@ -223,6 +247,7 @@ private fun PlayerContent(
                     scaffold = state.settings,
                     positionProvider = viewModel::positionTicks,
                     modifier = Modifier.fillMaxSize(),
+                    zoom = state.scoreZoom,
                     loadError = state.scoreError,
                     onEvent = viewModel::onScoreEvent,
                 )
@@ -258,7 +283,9 @@ private fun PlayerContent(
 
         Box(Modifier.weight(1f)) {
             when {
-                !showScore -> highway(Modifier.fillMaxSize())
+                !bothPanes && showScore -> score(Modifier.fillMaxSize())
+
+                !bothPanes -> highway(Modifier.fillMaxSize())
 
                 placement == ScorePlacement.TOP -> Column(Modifier.fillMaxSize()) {
                     score(Modifier.fillMaxWidth().weight(clampedScore))
@@ -285,6 +312,10 @@ private fun PlayerContent(
         }
 
         TransportBar(state, viewModel, model)
+    }
+
+    if (state.showViewerSettings) {
+        ViewerSettingsSheet(state, viewModel, onDismiss = viewModel::hideViewerSettings)
     }
 }
 
@@ -356,6 +387,14 @@ private fun TopBar(state: PlayerUiState, viewModel: PlayerViewModel, onBack: () 
                     tint = if (state.showScore) HandColors.amber else Color(0xFF7A8496),
                 )
             }
+        }
+
+        IconButton(onClick = viewModel::toggleViewerSettings) {
+            Icon(
+                Icons.Default.Tune,
+                contentDescription = "View settings",
+                tint = if (state.showViewerSettings) HandColors.amber else Color(0xFFB6BDCA),
+            )
         }
 
         // The shortcuts exist whether or not a keyboard is attached, so they
