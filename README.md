@@ -75,9 +75,12 @@ read by everything else. A UI-side timer would gradually drift against the audio
 and the falling notes would stop matching what you hear.
 
 **Nothing calls the synth from the UI thread.** Note events go into a lock-free
-ring buffer that the audio callback drains itself, applying them at exact frame
-offsets. That makes note timing sample-accurate rather than buffer-accurate, and
-it is why a run of sixteenths doesn't sound lumpy.
+ring buffer that the audio callback drains itself, sorts back into musical order,
+and applies at exact frame offsets. That makes note timing sample-accurate rather
+than buffer-accurate, and it is why a run of sixteenths doesn't sound lumpy. The
+sorting stage is not decoration: the scheduler emits each note's start and end
+together, so a chord reaches the callback interleaved, and a queue that trusted
+arrival order would play the first note of every chord and drop the rest.
 
 **Tempo change is free.** Because playback synthesises from note events rather
 than replaying audio, playing at half speed just means spacing the same events
@@ -89,7 +92,18 @@ Per-hand muting and seamless looping fall out of the same design.
 ```bash
 ./gradlew :app:assembleRelease   # signed APK in app/build/outputs/apk/release/
 ./gradlew :core:test             # unit tests
+
+# The two pieces that cannot be reached from a JVM test, both run on the host:
+c++ -std=c++17 -o /tmp/eqt audio/src/main/cpp/test/event_queue_test.cpp && /tmp/eqt
+npm --prefix tools/score-test install && node tools/score-test/scorepane.test.mjs
 ```
+
+The scheduler queues are deliberately free of Oboe and TSF so the event ordering
+the audio callback depends on can be checked with a plain compiler. The score
+pane test drives the real Verovio build and the real `score.js` through jsdom —
+that pane catches its own errors and replaces itself with a polite message, so
+without an end-to-end check a total failure looks exactly like a feature that was
+never built.
 
 Requires JDK 21 and the Android SDK with NDK 28.2.13676358 and CMake. The release
 signing key is committed deliberately — see [KEYS.md](KEYS.md), which also

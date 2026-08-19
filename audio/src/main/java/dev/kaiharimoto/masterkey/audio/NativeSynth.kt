@@ -46,7 +46,14 @@ internal class NativeSynth {
     fun scheduleMetronome(frame: Long, accent: Boolean, gain: Float) =
         nativeScheduleMetronome(frame, accent, gain)
 
-    fun allNotesOff(frame: Long) = nativeAllNotesOff(frame)
+    /**
+     * Silences every voice and discards everything already queued, immediately.
+     *
+     * Not a scheduled event: the callers — pausing, and wrapping a loop — want
+     * the queue emptied as well as the notes stopped, and a queued event cannot
+     * empty the queue it is sitting in.
+     */
+    fun flush() = nativeFlush()
 
     fun setChannelVolume(frame: Long, channel: Int, volume: Float) =
         nativeSetChannelVolume(frame, channel, volume)
@@ -65,7 +72,7 @@ internal class NativeSynth {
     private external fun nativeScheduleNoteOn(frame: Long, channel: Int, key: Int, velocity: Int)
     private external fun nativeScheduleNoteOff(frame: Long, channel: Int, key: Int)
     private external fun nativeScheduleMetronome(frame: Long, accent: Boolean, gain: Float)
-    private external fun nativeAllNotesOff(frame: Long)
+    private external fun nativeFlush()
     private external fun nativeSetChannelVolume(frame: Long, channel: Int, volume: Float)
     private external fun nativeSetSustain(frame: Long, channel: Int, on: Boolean)
     private external fun nativeSetMasterGain(gain: Float)

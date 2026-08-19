@@ -59,6 +59,11 @@
     stroke: #ffffff;
   }
 
+  /* Fingering is engraved unconditionally — Verovio has no option to leave it
+     out — so the scaffold dial hides it here instead. A class beats a relayout:
+     re-engraving the page to drop a few digits would stall the pane. */
+  body.mk-hide-fingering #page svg .fing { display: none; }
+
   #measureBox {
     position: absolute;
     pointer-events: none;

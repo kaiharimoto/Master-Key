@@ -1,6 +1,7 @@
 package dev.kaiharimoto.masterkey.ui.player
 
 import android.app.Application
+import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
@@ -19,6 +20,7 @@ import dev.kaiharimoto.masterkey.core.score.ScoreDocument
 import dev.kaiharimoto.masterkey.data.SongEntity
 import dev.kaiharimoto.masterkey.data.SongRepository
 import dev.kaiharimoto.masterkey.playback.PlaybackService
+import dev.kaiharimoto.masterkey.ui.score.ScoreEvent
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -319,6 +321,21 @@ class PlayerViewModel(
         persist { it.copy(lookAheadBeats = beats) }
     }
 
+    /**
+     * Lifecycle and error reports from the engraver.
+     *
+     * Worth logging rather than dropping: the pane catches its own exceptions
+     * and replaces itself with "this score could not be read", so a broken
+     * engraver looks exactly like a missing feature from the outside.
+     */
+    fun onScoreEvent(event: ScoreEvent) {
+        when (event) {
+            is ScoreEvent.Failed -> Log.w(TAG, "score pane: ${event.message}")
+            is ScoreEvent.Loaded -> Log.i(TAG, "score engraved: ${event.pages} page(s)")
+            else -> Unit
+        }
+    }
+
     fun toggleScore() {
         val show = !_state.value.showScore
         _state.value = _state.value.copy(showScore = show)
@@ -379,6 +396,7 @@ class PlayerViewModel(
     companion object {
         val DRILL_TEMPI = listOf(0.6f, 0.9f, 0.7f, 1.0f, 0.8f, 1.0f)
 
+        private const val TAG = "MasterKeyPlayer"
         private const val RANGE_POLL_MS = 300L
 
         fun factory(songId: String) = object : ViewModelProvider.Factory {

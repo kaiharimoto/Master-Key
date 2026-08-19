@@ -9,6 +9,12 @@
  *    a lock-free single-producer/single-consumer ring buffer, and the audio
  *    callback drains that buffer itself.
  *
+ *  - The ring is FIFO, so it delivers events in *production* order, which is not
+ *    musical order: the scheduler emits each note's on and off together, so a
+ *    chord arrives as on/off, on/off, on/off. The callback therefore drains the
+ *    ring into an EventTimeline (a fixed-capacity min-heap) and applies events
+ *    from there. Both live in event_queue.h, which has host-side tests.
+ *
  *  - Because the callback applies events at exact frame offsets (splitting each
  *    render into segments at event boundaries), note timing is sample-accurate
  *    rather than buffer-accurate. That is what keeps a 120 bpm run of 16ths from
@@ -33,6 +39,7 @@
 #include <memory>
 #include <vector>
 
+#include "event_queue.h"
 #include "third_party/tsf.h"
 
 #include <android/log.h>
@@ -42,62 +49,21 @@
 
 namespace {
 
-constexpr int kChannels = 2;              // stereo interleaved
-constexpr size_t kRingCapacity = 1 << 14; // 16384 events, power of two
-constexpr size_t kRingMask = kRingCapacity - 1;
+constexpr int kChannels = 2; // stereo interleaved
 
-enum EventType : uint8_t {
-    kNoteOn = 0,
-    kNoteOff = 1,
-    kAllNotesOff = 2,
-    kChannelVolume = 3,
-    kSustain = 4,
-    kMetronome = 5,
-};
+/** 16384 events is several minutes of dense music; the lookahead is 400 ms. */
+constexpr size_t kQueueCapacity = 1 << 14;
 
-struct Event {
-    int64_t frame;
-    uint32_t generation;
-    uint8_t type;
-    uint8_t channel;
-    uint8_t key;
-    uint8_t velocity;
-    float value;
-};
+using masterkey::Event;
+using masterkey::EventType;
+using masterkey::kChannelVolume;
+using masterkey::kMetronome;
+using masterkey::kNoteOff;
+using masterkey::kNoteOn;
+using masterkey::kSustain;
 
-/**
- * Lock-free SPSC ring. `writeIndex` is only ever written by the producer,
- * `readIndex` only by the audio callback, so no CAS is needed — release/acquire
- * ordering on the two indices is sufficient.
- */
-class EventRing {
-public:
-    bool push(const Event& e) {
-        const size_t w = writeIndex_.load(std::memory_order_relaxed);
-        const size_t r = readIndex_.load(std::memory_order_acquire);
-        if (w - r >= kRingCapacity) return false; // full; drop rather than block
-        buffer_[w & kRingMask] = e;
-        writeIndex_.store(w + 1, std::memory_order_release);
-        return true;
-    }
-
-    const Event* peek() const {
-        const size_t r = readIndex_.load(std::memory_order_relaxed);
-        const size_t w = writeIndex_.load(std::memory_order_acquire);
-        if (r == w) return nullptr;
-        return &buffer_[r & kRingMask];
-    }
-
-    void pop() {
-        const size_t r = readIndex_.load(std::memory_order_relaxed);
-        readIndex_.store(r + 1, std::memory_order_release);
-    }
-
-private:
-    Event buffer_[kRingCapacity]{};
-    std::atomic<size_t> writeIndex_{0};
-    std::atomic<size_t> readIndex_{0};
-};
+using EventRing = masterkey::EventRing<kQueueCapacity>;
+using EventTimeline = masterkey::EventTimeline<kQueueCapacity>;
 
 /**
  * A tiny click generator for the metronome.
@@ -225,9 +191,35 @@ public:
         seekPending_.store(true, std::memory_order_release);
     }
 
+    /**
+     * Silences everything and forgets what was queued, without moving the clock.
+     *
+     * This is what pausing and wrapping a loop need. Both leave releases queued
+     * for notes that are about to be cut anyway, and at a loop wrap those stale
+     * releases would land on top of the same keys struck again at the top of the
+     * next pass — chopping the first chord of every repeat.
+     */
+    void requestFlush() {
+        generation_.fetch_add(1, std::memory_order_release);
+        flushPending_.store(true, std::memory_order_release);
+    }
+
     void setPlaying(bool playing) { playing_.store(playing, std::memory_order_release); }
 
-    int64_t transportFrames() const { return transportFrames_.load(std::memory_order_acquire); }
+    /**
+     * The transport clock, as the producer should see it.
+     *
+     * While a seek is pending the callback has not applied it yet, so the raw
+     * counter still reads the old position. Returning the target instead means
+     * the scheduler can anchor immediately after asking for a seek without
+     * racing a buffer's worth of audio.
+     */
+    int64_t transportFrames() const {
+        if (seekPending_.load(std::memory_order_acquire)) {
+            return seekTarget_.load(std::memory_order_acquire);
+        }
+        return transportFrames_.load(std::memory_order_acquire);
+    }
 
     void setMasterGain(float gain) { masterGain_.store(gain, std::memory_order_relaxed); }
 
@@ -240,11 +232,30 @@ public:
 
         if (tsf_ == nullptr) return oboe::DataCallbackResult::Continue;
 
+        // Both of these run before the ring is drained, so events pushed after
+        // the request — which carry the new generation — survive.
         if (seekPending_.exchange(false, std::memory_order_acq_rel)) {
             tsf_note_off_all(tsf_);
+            // Anything already sorted into the timeline belongs to the old
+            // position; the ring is filtered by generation as it is drained.
+            timeline_.clear();
             transportFrames_.store(seekTarget_.load(std::memory_order_acquire),
                                    std::memory_order_release);
         }
+        if (flushPending_.exchange(false, std::memory_order_acq_rel)) {
+            tsf_note_off_all(tsf_);
+            timeline_.clear();
+        }
+
+        drainRing();
+
+        int64_t pos = transportFrames_.load(std::memory_order_relaxed);
+
+        // Events dated now or earlier are applied whether or not the transport
+        // is running. Pausing schedules an all-notes-off at the current frame,
+        // and muting a hand schedules a volume change there — neither can wait
+        // for playback to resume.
+        applyDueEvents(pos);
 
         if (!playing_.load(std::memory_order_acquire)) {
             // Still render so release tails and the metronome finish cleanly,
@@ -255,32 +266,22 @@ public:
             return oboe::DataCallbackResult::Continue;
         }
 
-        int64_t pos = transportFrames_.load(std::memory_order_relaxed);
         int32_t done = 0;
-
         while (done < numFrames) {
-            dropStaleEvents();
-
-            // Apply everything due at or before the current position.
-            const Event* next = ring_.peek();
-            while (next != nullptr && next->frame <= pos) {
-                applyEvent(*next);
-                ring_.pop();
-                dropStaleEvents();
-                next = ring_.peek();
-            }
+            applyDueEvents(pos);
 
             // Render up to the next event, or to the end of the buffer.
             int64_t limit = pos + (numFrames - done);
-            if (next != nullptr && next->frame < limit) limit = next->frame;
+            if (const Event* next = timeline_.top()) {
+                if (next->frame < limit) limit = next->frame;
+            }
 
             const auto segment = static_cast<int32_t>(limit - pos);
-            if (segment <= 0) {
-                // An event landed exactly on `pos`; the loop above will consume
-                // it on the next pass. If there is nothing left, we are done.
-                if (next == nullptr) break;
-                continue;
-            }
+            // The timeline is ordered, so applyDueEvents() has already consumed
+            // everything at or before `pos` and the next event is strictly
+            // later. A non-positive segment would mean the heap is broken;
+            // bail out rather than spin.
+            if (segment <= 0) break;
 
             tsf_render_float(tsf_, out + static_cast<size_t>(done) * kChannels, segment, 0);
             click_.render(out + static_cast<size_t>(done) * kChannels, segment);
@@ -308,12 +309,37 @@ private:
         for (int32_t i = 0; i < n; ++i) out[i] *= g;
     }
 
-    void dropStaleEvents() {
+    /**
+     * Moves everything waiting in the ring into the timeline, in one go.
+     *
+     * Draining eagerly is what makes the ordering work: the heap can only sort
+     * events it has actually seen, so holding some back would reintroduce the
+     * head-of-line stall the timeline exists to remove. Events from before a
+     * seek are dropped here rather than applied.
+     */
+    void drainRing() {
         const uint32_t gen = generation_.load(std::memory_order_acquire);
-        const Event* e = ring_.peek();
-        while (e != nullptr && e->generation != gen) {
+        while (const Event* e = ring_.peek()) {
+            if (e->generation != gen) {
+                ring_.pop();
+                continue;
+            }
+            Event event = *e;
+            event.sequence = nextSequence_++;
+            // A full timeline means ~16k events pending, which the 400 ms
+            // lookahead cannot produce. Leave the rest in the ring for the next
+            // callback rather than dropping them.
+            if (!timeline_.push(event)) break;
             ring_.pop();
-            e = ring_.peek();
+        }
+    }
+
+    /** Applies every event dated at or before [pos], in musical order. */
+    void applyDueEvents(int64_t pos) {
+        while (const Event* next = timeline_.top()) {
+            if (next->frame > pos) break;
+            applyEvent(*next);
+            timeline_.pop();
         }
     }
 
@@ -325,9 +351,6 @@ private:
                 break;
             case kNoteOff:
                 tsf_channel_note_off(tsf_, e.channel, e.key);
-                break;
-            case kAllNotesOff:
-                tsf_note_off_all(tsf_);
                 break;
             case kChannelVolume:
                 tsf_channel_set_volume(tsf_, e.channel, e.value);
@@ -348,11 +371,15 @@ private:
     int sampleRate_ = 48000;
     std::shared_ptr<oboe::AudioStream> stream_;
     EventRing ring_;
+    /** Owned by the callback: never touched from the producer thread. */
+    EventTimeline timeline_;
+    uint64_t nextSequence_ = 0;
     Click click_;
 
     std::atomic<int64_t> transportFrames_{0};
     std::atomic<int64_t> seekTarget_{0};
     std::atomic<bool> seekPending_{false};
+    std::atomic<bool> flushPending_{false};
     std::atomic<bool> playing_{false};
     std::atomic<uint32_t> generation_{1};
     std::atomic<float> masterGain_{1.0f};
@@ -454,10 +481,8 @@ Java_dev_kaiharimoto_masterkey_audio_NativeSynth_nativeScheduleMetronome(
 }
 
 JNIEXPORT void JNICALL
-Java_dev_kaiharimoto_masterkey_audio_NativeSynth_nativeAllNotesOff(JNIEnv*, jobject,
-                                                                   jlong frame) {
-    if (!gEngine) return;
-    gEngine->schedule(makeEvent(kAllNotesOff, frame, 0, 0, 0, 0.0f));
+Java_dev_kaiharimoto_masterkey_audio_NativeSynth_nativeFlush(JNIEnv*, jobject) {
+    if (gEngine) gEngine->requestFlush();
 }
 
 JNIEXPORT void JNICALL

@@ -2,6 +2,7 @@ package dev.kaiharimoto.masterkey.audio
 
 import android.content.Context
 import dev.kaiharimoto.masterkey.core.model.Hand
+import dev.kaiharimoto.masterkey.core.model.Note
 import dev.kaiharimoto.masterkey.core.model.Piece
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
@@ -69,8 +70,16 @@ class PlaybackEngine(private val context: Context) {
     /** Index of the next note to schedule; reset on seek. */
     private var nextNoteIndex = 0
 
-    /** Beat already scheduled for the metronome; reset on seek. */
-    private var nextMetronomeBeat = 0L
+    /** Tick of the next metronome click; reset on seek. */
+    private var nextMetronomeTick = 0L
+
+    /**
+     * Longest note in the piece.
+     *
+     * [notes] is sorted by *start* tick, so finding what is still sounding at a
+     * given moment means looking back at least this far.
+     */
+    private var maxNoteDurationTicks = 0L
 
     /**
      * Frame at which the current tick-to-frame mapping was anchored, and the tick
@@ -101,7 +110,9 @@ class PlaybackEngine(private val context: Context) {
 
     suspend fun load(piece: Piece) = withContext(engineDispatcher) {
         this@PlaybackEngine.piece = piece
+        maxNoteDurationTicks = piece.notes.maxOfOrNull { it.durationTicks } ?: 0L
         stopInternal()
+        _state.value = _state.value.copy(positionTick = 0L)
         seekInternal(0L)
     }
 
@@ -121,34 +132,64 @@ class PlaybackEngine(private val context: Context) {
      * nothing to keep in sync with the music that follows.
      */
     private fun startPlaying(withCountIn: Boolean) {
+        val tick = _state.value.positionTick.coerceIn(0L, piece.endTick)
         val bars = if (withCountIn) _state.value.countInBars else 0
-        val countInFrames = if (bars > 0) countInFrames(bars) else 0L
+        val countInFrames = if (bars > 0) countInFrames(bars, tick) else 0L
 
-        anchorFrame = synth.transportFrames() + countInFrames
-        anchorTick = _state.value.positionTick
+        // Always re-seek, even when resuming from a pause at the same position.
+        // The seek bumps the native event generation, which discards whatever
+        // was queued for the old anchor — otherwise the notes scheduled in the
+        // last 400 ms before the pause would all fire the moment play resumed.
+        val base = frameForTickAbsolute(tick)
+        synth.seek(base)
+        resetCursors(tick)
+
+        anchorTick = tick
+        anchorFrame = base + countInFrames
         countInUntilFrame = anchorFrame
 
-        applyHandVolumes()
-        if (countInFrames > 0) scheduleCountIn(bars, anchorFrame - countInFrames)
+        applyHandVolumes(base)
+        if (countInFrames > 0) scheduleCountIn(bars, base)
+        scheduleNotesAlreadySounding(tick)
 
         synth.setPlaying(true)
         _state.value = _state.value.copy(isPlaying = true, countingIn = countInFrames > 0)
         startScheduler()
     }
 
-    private fun countInFrames(bars: Int): Long {
-        val signature = piece.timeSignatureAt(anchorTickOrPosition())
+    private fun countInFrames(bars: Int, startTick: Long): Long {
+        val signature = piece.timeSignatureAt(startTick)
         val ticksPerBar = signature.ticksPerBar(piece.tempoMap.ticksPerQuarter).coerceAtLeast(1L)
-        val startTick = _state.value.positionTick
         val micros = piece.tempoMap.tickToMicros(startTick + ticksPerBar * bars) -
             piece.tempoMap.tickToMicros(startTick)
         return ((micros / tempoScale) * sampleRate / 1_000_000.0).roundToLong()
     }
 
-    private fun anchorTickOrPosition(): Long = _state.value.positionTick
+    /**
+     * Sounds the notes that are already ringing at [tick].
+     *
+     * [nextNoteIndex] points at the first note that *begins* at or after the
+     * playhead, so starting inside a held chord — which is what looping a bar or
+     * scrubbing into the middle of a phrase does — would otherwise be silent
+     * until the next attack. These are struck at the anchor and released where
+     * they were written to end.
+     */
+    private fun scheduleNotesAlreadySounding(tick: Long) {
+        if (tick <= 0L) return
+        val limit = _state.value.loop?.endTick ?: piece.endTick
+        var index = firstNoteIndexAtOrAfter(tick - maxNoteDurationTicks)
+        while (index < piece.notes.size) {
+            val note = piece.notes[index]
+            index++
+            if (note.startTick >= tick) break
+            val endTick = note.endTick.coerceAtMost(limit)
+            if (endTick <= tick) continue
+            scheduleNote(note, onFrame = anchorFrame, endTick = endTick)
+        }
+    }
 
     private fun scheduleCountIn(bars: Int, fromFrame: Long) {
-        val signature = piece.timeSignatureAt(_state.value.positionTick)
+        val signature = piece.timeSignatureAt(anchorTick)
         val beats = signature.numerator * bars
         if (beats <= 0) return
         val span = anchorFrame - fromFrame
@@ -175,20 +216,21 @@ class PlaybackEngine(private val context: Context) {
     fun stop() {
         scope.launch {
             stopInternal()
-            seekInternal(0L)
             _state.value = _state.value.copy(isPlaying = false, positionTick = 0L)
+            seekInternal(0L)
         }
     }
 
     fun seek(tick: Long) {
         scope.launch {
+            val target = tick.coerceIn(0L, piece.endTick)
             val wasPlaying = _state.value.isPlaying
             if (wasPlaying) stopInternal()
-            seekInternal(tick.coerceIn(0L, piece.endTick))
-            _state.value = _state.value.copy(positionTick = tick.coerceIn(0L, piece.endTick))
+            _state.value = _state.value.copy(positionTick = target)
             // No count-in when scrubbing: a click burst on every drag of the
-            // playhead would be maddening.
-            if (wasPlaying) startPlaying(withCountIn = false)
+            // playhead would be maddening. startPlaying() re-seeks itself, so
+            // the paused case is the only one that has to do it here.
+            if (wasPlaying) startPlaying(withCountIn = false) else seekInternal(target)
         }
     }
 
@@ -206,9 +248,8 @@ class PlaybackEngine(private val context: Context) {
             val wasPlaying = _state.value.isPlaying
             if (wasPlaying) stopInternal()
             tempoScale = clamped
-            seekInternal(tick)
             _state.value = _state.value.copy(tempoScale = clamped, positionTick = tick)
-            if (wasPlaying) startPlaying(withCountIn = false)
+            if (wasPlaying) startPlaying(withCountIn = false) else seekInternal(tick)
         }
     }
 
@@ -280,15 +321,7 @@ class PlaybackEngine(private val context: Context) {
         }
 
         if (loop != null && nowTick >= loop.endTick) {
-            // Jump back without stopping the stream, so the loop is seamless.
-            synth.allNotesOff(synth.transportFrames())
-            seekInternal(loop.startTick)
-            anchorFrame = synth.transportFrames()
-            anchorTick = loop.startTick
-            // No count-in on a loop wrap — the whole point is that it repeats
-            // without a gap.
-            countInUntilFrame = anchorFrame
-            _state.value = _state.value.copy(positionTick = loop.startTick)
+            wrapLoop(loop)
             return
         }
 
@@ -304,32 +337,80 @@ class PlaybackEngine(private val context: Context) {
         while (nextNoteIndex < piece.notes.size) {
             val note = piece.notes[nextNoteIndex]
             if (note.startTick >= horizonTick || note.startTick >= limit) break
-            val channel = note.hand.synthChannel
-            synth.scheduleNoteOn(frameAtTick(note.startTick), channel, note.pitch, note.velocity)
-            synth.scheduleNoteOff(
-                frameAtTick(note.endTick.coerceAtMost(limit)),
-                channel,
-                note.pitch,
+            scheduleNote(
+                note,
+                onFrame = frameAtTick(note.startTick),
+                endTick = note.endTick.coerceAtMost(limit),
             )
             nextNoteIndex++
         }
 
-        if (_state.value.metronomeEnabled) scheduleMetronome(horizonTick, limit)
+        scheduleMetronome(horizonTick, limit, audible = _state.value.metronomeEnabled)
 
         _state.value = _state.value.copy(positionTick = nowTick)
     }
 
-    private fun scheduleMetronome(horizonTick: Long, limitTick: Long) {
+    /**
+     * Restarts the loop without touching the transport.
+     *
+     * Re-anchoring rather than seeking is what keeps the wrap gapless: the audio
+     * clock keeps running and the stream is never restarted, only the
+     * tick-to-frame mapping moves back to the top of the loop.
+     */
+    private fun wrapLoop(loop: LoopRegion) {
+        val frame = synth.transportFrames()
+        // Also drops the releases queued for the notes being cut. Left in place
+        // they would land a moment into the next pass and chop the same keys
+        // struck again at the top of the loop.
+        synth.flush()
+        anchorTick = loop.startTick
+        anchorFrame = frame
+        // No count-in on a loop wrap — the whole point is that it repeats
+        // without a gap.
+        countInUntilFrame = frame
+        resetCursors(loop.startTick)
+        scheduleNotesAlreadySounding(loop.startTick)
+        _state.value = _state.value.copy(positionTick = loop.startTick)
+    }
+
+    /**
+     * Queues one note's pair of events.
+     *
+     * The release is forced at least one frame after the attack. Events sharing
+     * a frame are applied note-off first, so that a key released and re-struck on
+     * the same beat is not killed by its own predecessor — which would silence a
+     * note that rounds to a zero-frame length.
+     */
+    private fun scheduleNote(note: Note, onFrame: Long, endTick: Long) {
+        val channel = note.hand.synthChannel
+        synth.scheduleNoteOn(onFrame, channel, note.pitch, note.velocity)
+        synth.scheduleNoteOff(maxOf(frameAtTick(endTick), onFrame + 1), channel, note.pitch)
+    }
+
+    /**
+     * Walks the beat grid up to the horizon.
+     *
+     * The cursor advances whether or not [audible] is set, so switching the
+     * metronome on mid-piece starts clicking at the next beat rather than firing
+     * off every beat it missed while it was silent.
+     */
+    private fun scheduleMetronome(horizonTick: Long, limitTick: Long, audible: Boolean) {
         val ticksPerQuarter = piece.tempoMap.ticksPerQuarter
-        while (true) {
-            val signature = piece.timeSignatureAt(nextMetronomeBeat * ticksPerQuarter)
-            val ticksPerBeat = signature.ticksPerBeat(ticksPerQuarter)
-            if (ticksPerBeat <= 0) return
-            val tick = nextMetronomeBeat * ticksPerBeat
-            if (tick >= horizonTick || tick >= limitTick) return
-            val beatInBar = (nextMetronomeBeat % signature.numerator).toInt()
-            synth.scheduleMetronome(frameAtTick(tick), accent = beatInBar == 0, gain = 0.35f)
-            nextMetronomeBeat++
+        while (nextMetronomeTick < horizonTick && nextMetronomeTick < limitTick) {
+            val signature = piece.timeSignatureAt(nextMetronomeTick)
+            val ticksPerBeat = signature.ticksPerBeat(ticksPerQuarter).coerceAtLeast(1L)
+            // Counted from where the signature itself starts, not from the top of
+            // the piece: after a change of metre the accent has to land on the
+            // new beat one, and the bar lengths either side rarely divide evenly.
+            val beatInBar = (nextMetronomeTick - signature.tick) / ticksPerBeat % signature.numerator
+            if (audible) {
+                synth.scheduleMetronome(
+                    frameAtTick(nextMetronomeTick),
+                    accent = beatInBar == 0L,
+                    gain = 0.35f,
+                )
+            }
+            nextMetronomeTick += ticksPerBeat
         }
     }
 
@@ -337,7 +418,7 @@ class PlaybackEngine(private val context: Context) {
         schedulerJob?.cancel()
         schedulerJob = null
         synth.setPlaying(false)
-        synth.allNotesOff(synth.transportFrames())
+        synth.flush()
     }
 
     /**
@@ -349,18 +430,37 @@ class PlaybackEngine(private val context: Context) {
     private fun seekInternal(tick: Long) {
         anchorTick = tick
         anchorFrame = frameForTickAbsolute(tick)
+        countInUntilFrame = anchorFrame
         synth.seek(anchorFrame)
-
-        nextNoteIndex = piece.notes.indexOfFirst { it.startTick >= tick }
-            .let { if (it < 0) piece.notes.size else it }
-
-        val signature = piece.timeSignatureAt(tick)
-        val ticksPerBeat = signature.ticksPerBeat(piece.tempoMap.ticksPerQuarter)
-        nextMetronomeBeat = if (ticksPerBeat > 0) tick / ticksPerBeat else 0L
+        resetCursors(tick)
     }
 
-    private fun applyHandVolumes() {
-        val frame = synth.transportFrames()
+    /** Rewinds the scheduling cursors to [tick]. Does not touch the transport. */
+    private fun resetCursors(tick: Long) {
+        nextNoteIndex = firstNoteIndexAtOrAfter(tick)
+        nextMetronomeTick = firstBeatAtOrAfter(tick)
+    }
+
+    /** Lower bound in [Piece.notes], which is sorted by start tick. */
+    private fun firstNoteIndexAtOrAfter(tick: Long): Int {
+        var low = 0
+        var high = piece.notes.size
+        while (low < high) {
+            val mid = (low + high) / 2
+            if (piece.notes[mid].startTick < tick) low = mid + 1 else high = mid
+        }
+        return low
+    }
+
+    private fun firstBeatAtOrAfter(tick: Long): Long {
+        val signature = piece.timeSignatureAt(tick)
+        val ticksPerBeat = signature.ticksPerBeat(piece.tempoMap.ticksPerQuarter).coerceAtLeast(1L)
+        val beatsIn = Math.floorDiv(tick - signature.tick, ticksPerBeat)
+        val beat = signature.tick + beatsIn * ticksPerBeat
+        return if (beat >= tick) beat else beat + ticksPerBeat
+    }
+
+    private fun applyHandVolumes(frame: Long = synth.transportFrames()) {
         synth.setChannelVolume(
             frame,
             Hand.RIGHT.synthChannel,

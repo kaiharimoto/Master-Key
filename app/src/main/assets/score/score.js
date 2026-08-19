@@ -11,21 +11,26 @@
  * so 20 Hz is imperceptibly smooth, while pumping a 60 Hz clock across the
  * JavaScript bridge is the classic way to make a WebView janky next to a
  * hardware-accelerated canvas.
+ *
+ * Everything the SVG cannot tell us has to be asked of the toolkit rather than
+ * inferred from the DOM, because the DOM only ever holds one page. That is why
+ * the current bar comes from the timemap and the page it lives on comes from
+ * getPageWithElement(): a note that has scrolled off the rendered page is not
+ * findable by id, and treating "not on this page" as "nowhere" leaves the score
+ * stuck on page one for the rest of the piece.
  */
 (function () {
   'use strict';
 
   var toolkit = null;
-  var timemap = [];       // [{ qstamp, tstamp, on: [ids], off: [ids] }]
-  var noteHand = {};      // element id -> 'right' | 'left'
-  var measureOfNote = {}; // element id -> measure element id
+  var timemap = [];       // [{ qstamp, tstamp, on: [ids], off: [ids], measureOn }]
+  var measureAt = [];     // timemap index -> id of the measure in effect there
+  var noteHand = {};      // element id -> 'right' | 'left', for the current page
   var currentPage = 0;
   var pageCount = 0;
   var sounding = {};      // element id -> true
   var currentMeasureId = null;
   var lastIndex = -1;
-  var ready = false;
-  var showFingering = true;
 
   var pageEl = document.getElementById('page');
   var statusEl = document.getElementById('status');
@@ -55,20 +60,42 @@
       scale: 40,
       adjustPageHeight: true,
       breaks: 'auto',
-      // Times is not on Android; Liberation ships with Verovio.
+      // Times is not on Android; Leipzig ships with Verovio.
       fontFallback: 'Leipzig',
       footer: 'none',
       header: 'none',
       spacingStaff: 10,
       spacingSystem: 8,
-      // Fingering comes straight from <technical><fingering> — a free win, and
-      // one of the highest value-for-effort reading aids there is.
-      showFingering: showFingering
+      // Puts data-n on every <g class="staff">. Nothing else in the SVG says
+      // which staff a notehead sits on, and the staff is how the two hands are
+      // told apart — without this every note would be coloured right-hand.
+      svgAdditionalAttribute: ['staff@n']
     };
   }
 
   function zoom() {
     return 100;
+  }
+
+  /**
+   * Verovio's JavaScript toolkit hands back an already-parsed timemap; older
+   * builds returned the JSON text. Accept either.
+   *
+   * Assuming the string form throws inside load(), which is caught and reported
+   * as "this score could not be read" — for a score that is perfectly fine. The
+   * whole pane looks unimplemented rather than broken, so it is worth being
+   * tolerant here.
+   */
+  function asTimemap(value) {
+    if (Array.isArray(value)) return value;
+    if (typeof value === 'string') {
+      try {
+        return JSON.parse(value) || [];
+      } catch (e) {
+        return [];
+      }
+    }
+    return [];
   }
 
   window.MasterKeyScore = {
@@ -77,7 +104,6 @@
       if (toolkit) return;
       try {
         toolkit = new verovio.toolkit();
-        ready = true;
         status('');
         post({ type: 'ready' });
       } catch (e) {
@@ -106,14 +132,16 @@
 
         // includeMeasures lets us highlight the whole current bar, which is the
         // single most useful aid for someone who loses their place while reading.
-        timemap = JSON.parse(
+        timemap = asTimemap(
           toolkit.renderToTimemap({ includeMeasures: true, includeRests: false })
-        ) || [];
+        );
+        indexMeasures();
 
         currentPage = 0;
+        currentMeasureId = null;
         lastIndex = -1;
+        sounding = {};
         renderPage(1);
-        indexHands();
 
         post({
           type: 'loaded',
@@ -123,7 +151,7 @@
           // timeline is already in performance order.
           lastQstamp: timemap.length ? timemap[timemap.length - 1].qstamp : 0
         });
-        status('');
+        status(timemap.length ? '' : 'This score has no playable notes.');
       } catch (e) {
         status('This score could not be read.');
         post({ type: 'error', message: String(e) });
@@ -140,45 +168,54 @@
 
       var index = findIndex(qstamp);
       if (index === lastIndex) return;
-      lastIndex = index;
 
-      var nowSounding = {};
-      // Walk forward from the start of the piece is too slow; instead rebuild the
-      // sounding set from the events up to here using on/off bookkeeping.
-      for (var i = 0; i <= index; i++) {
-        var entry = timemap[i];
-        if (entry.off) {
-          for (var j = 0; j < entry.off.length; j++) delete nowSounding[entry.off[j]];
-        }
-        if (entry.on) {
-          for (var k = 0; k < entry.on.length; k++) nowSounding[entry.on[k]] = true;
-        }
+      var next = {};
+      var from = 0;
+      if (index > lastIndex) {
+        // Ordinary playback: carry the current set forward over the entries
+        // crossed since the last update, rather than replaying the whole piece
+        // twenty times a second.
+        for (var id in sounding) next[id] = true;
+        from = lastIndex + 1;
       }
+      // Backwards — a scrub or a loop wrap — has to start over, because the
+      // on/off bookkeeping in the timemap only runs one way.
+      for (var i = from; i <= index; i++) accumulate(next, timemap[i]);
 
-      applySounding(nowSounding);
-      updateMeasure(index);
+      lastIndex = index;
+      applySounding(next);
+      updateMeasure(measureAt[index]);
     },
 
     setPage: function (page) {
       renderPage(page);
     },
 
-    /** Toggles engraved fingering. Needs a relayout, so it is not per-frame. */
+    /**
+     * Toggles engraved fingering.
+     *
+     * A class on the body rather than a Verovio option: fingerings are ordinary
+     * SVG elements once engraved, so hiding them is a CSS rule and needs no
+     * relayout. (Verovio has no `showFingering` option — passing one is rejected
+     * and silently changes nothing.)
+     */
     setFingering: function (enabled) {
-      if (!toolkit) return;
-      if (showFingering === enabled) return;
-      showFingering = enabled;
-      window.MasterKeyScore.relayout();
+      if (enabled) {
+        document.body.classList.remove('mk-hide-fingering');
+      } else {
+        document.body.classList.add('mk-hide-fingering');
+      }
     },
 
     relayout: function () {
-      if (!toolkit) return;
+      if (!toolkit || !timemap.length) return;
       try {
         toolkit.setOptions(options());
         toolkit.redoLayout();
         pageCount = toolkit.getPageCount();
-        renderPage(currentPage || 1);
-        indexHands();
+        // The bar being played may well have moved to a different page.
+        var page = currentMeasureId ? toolkit.getPageWithElement(currentMeasureId) : 0;
+        renderPage(page || currentPage || 1, true);
       } catch (e) {
         post({ type: 'error', message: String(e) });
       }
@@ -190,50 +227,82 @@
     }
   };
 
-  function renderPage(page) {
+  /**
+   * Which measure is in effect at each timemap index.
+   *
+   * `measureOn` only appears on the entry where a bar starts, so it is carried
+   * forward. Reading the bar from the timemap rather than from the sounding
+   * notes is what lets updateMeasure() turn the page: the notes it would have
+   * looked up are, by definition, not in the DOM when they are on another page.
+   */
+  function indexMeasures() {
+    measureAt = new Array(timemap.length);
+    var current = null;
+    for (var i = 0; i < timemap.length; i++) {
+      if (timemap[i].measureOn) current = timemap[i].measureOn;
+      measureAt[i] = current;
+    }
+  }
+
+  function accumulate(set, entry) {
+    if (!entry) return;
+    var i;
+    if (entry.off) {
+      for (i = 0; i < entry.off.length; i++) delete set[entry.off[i]];
+    }
+    if (entry.on) {
+      for (i = 0; i < entry.on.length; i++) set[entry.on[i]] = true;
+    }
+  }
+
+  function renderPage(page, force) {
     if (!toolkit || page < 1) return;
     if (pageCount && page > pageCount) page = pageCount;
-    if (page === currentPage) return;
+    if (page === currentPage && !force) return;
     currentPage = page;
     pageEl.innerHTML = toolkit.renderToSVG(page, {});
-    // Re-applying colours after a page change; the SVG is new DOM.
-    applyHandClasses();
+    // The manual scroll offset belonged to the page just replaced.
+    pageEl.dataset.offset = '0';
+    pageEl.style.transform = 'translateY(0px)';
+    indexHands();
+    reapplyClasses();
     post({ type: 'page', page: page, pages: pageCount });
   }
 
   /**
-   * Tags each note with the hand that plays it, from the staff it sits on.
+   * Tags each note on the current page with the hand that plays it.
    *
    * Staff 1 is the upper (right hand), staff 2 the lower. Taking this from the
    * notation rather than guessing from pitch is why the score view and the
-   * highway always agree on colour.
+   * highway always agree on colour. The `data-n` attribute comes from the
+   * svgAdditionalAttribute option — the SVG carries no staff number without it.
    */
   function indexHands() {
     noteHand = {};
-    measureOfNote = {};
     var staves = pageEl.querySelectorAll('.staff');
     for (var s = 0; s < staves.length; s++) {
       var staff = staves[s];
-      var n = staff.getAttribute('data-n') || staff.getAttribute('n');
-      var hand = (n === '2') ? 'left' : 'right';
+      var hand = staff.getAttribute('data-n') === '2' ? 'left' : 'right';
       var notes = staff.querySelectorAll('.note');
       for (var i = 0; i < notes.length; i++) {
-        var id = notes[i].getAttribute('data-id') || notes[i].id;
+        var id = notes[i].id;
         if (!id) continue;
         noteHand[id] = hand;
-        var measure = notes[i].closest ? notes[i].closest('.measure') : null;
-        if (measure) measureOfNote[id] = measure.id || measure.getAttribute('data-id');
+        notes[i].classList.add(hand === 'left' ? 'mk-left' : 'mk-right');
       }
     }
-    applyHandClasses();
   }
 
-  function applyHandClasses() {
-    for (var id in noteHand) {
-      if (!Object.prototype.hasOwnProperty.call(noteHand, id)) continue;
-      var el = document.getElementById(id);
-      if (!el) continue;
-      el.classList.add(noteHand[id] === 'left' ? 'mk-left' : 'mk-right');
+  /** Re-marks the current bar and the sounding notes after a page is rebuilt. */
+  function reapplyClasses() {
+    for (var id in sounding) {
+      var note = document.getElementById(id);
+      if (note) note.classList.add('mk-sounding');
+    }
+    if (currentMeasureId) {
+      var measure = document.getElementById(currentMeasureId);
+      if (measure) measure.classList.add('mk-current');
+      markNeighbours(currentMeasureId);
     }
   }
 
@@ -253,41 +322,43 @@
     sounding = next;
   }
 
-  function updateMeasure(index) {
-    // Find the measure this event belongs to by looking at any sounding note,
-    // falling back to the nearest measure entry in the timemap.
-    var measureId = null;
-    for (var id in sounding) {
-      if (measureOfNote[id]) { measureId = measureOfNote[id]; break; }
-    }
-    if (!measureId) return;
-    if (measureId === currentMeasureId) return;
+  function updateMeasure(measureId) {
+    if (!measureId || measureId === currentMeasureId) return;
+
+    // Turn to the page the bar is on before touching the DOM. Verovio tells us
+    // which page an element is on, so page turns need no bookkeeping of ours.
+    var page = toolkit ? toolkit.getPageWithElement(measureId) : 0;
+    if (page && page !== currentPage) renderPage(page);
 
     if (currentMeasureId) {
       var old = document.getElementById(currentMeasureId);
       if (old) old.classList.remove('mk-current');
     }
     currentMeasureId = measureId;
+
     var el = document.getElementById(measureId);
-    if (!el) {
-      // The current measure is on another page — turn to it. Verovio tells us
-      // which page an element is on, so page turns need no manual bookkeeping.
-      var page = toolkit ? toolkit.getPageWithElement(measureId) : 0;
-      if (page && page !== currentPage) {
-        renderPage(page);
-        el = document.getElementById(measureId);
-      }
+    if (!el) return;
+    el.classList.add('mk-current');
+    markNeighbours(measureId);
+    scrollToElement(el);
+  }
+
+  /** The bars either side sit between "current" and "elsewhere" in the dimming. */
+  function markNeighbours(measureId) {
+    var all = pageEl.querySelectorAll('.measure');
+    var index = -1;
+    for (var i = 0; i < all.length; i++) {
+      all[i].classList.remove('mk-near');
+      if (all[i].id === measureId) index = i;
     }
-    if (el) {
-      el.classList.add('mk-current');
-      scrollToElement(el);
-    }
+    if (index < 0) return;
+    if (index > 0) all[index - 1].classList.add('mk-near');
+    if (index + 1 < all.length) all[index + 1].classList.add('mk-near');
   }
 
   function scrollToElement(el) {
     // Drive the scroll ourselves rather than using scrollIntoView, which is
     // documented to behave inconsistently inside Android's WebView.
-    var box = el.getBBox ? null : null;
     var rect = el.getBoundingClientRect();
     var viewRect = viewportEl.getBoundingClientRect();
     var offset = rect.top - viewRect.top;
@@ -310,12 +381,26 @@
     return lo;
   }
 
-  // verovio-toolkit-wasm.js exposes a promise-like `verovio.module.onRuntimeInitialized`.
-  if (typeof verovio !== 'undefined' && verovio.module) {
+  // Dragging the split handle resizes the pane continuously, and redoLayout is
+  // the expensive half of engraving — so relayout only once the drag settles.
+  var resizeTimer = null;
+  window.addEventListener('resize', function () {
+    if (resizeTimer) clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(function () {
+      resizeTimer = null;
+      window.MasterKeyScore.relayout();
+    }, 250);
+  });
+
+  // verovio-toolkit-wasm.js runs its module as soon as the WASM instantiates,
+  // which may already have happened by the time this file executes.
+  if (typeof verovio === 'undefined' || !verovio.module) {
+    status('Engraver failed to load.');
+  } else if (verovio.module.calledRun) {
+    window.MasterKeyScore.init();
+  } else {
     verovio.module.onRuntimeInitialized = function () {
       window.MasterKeyScore.init();
     };
-  } else {
-    status('Engraver failed to load.');
   }
 })();

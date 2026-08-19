@@ -12,3 +12,6 @@ captures/
 # NOTE: the release keystore is deliberately NOT ignored.
 # See KEYS.md — it must be committed so the app can be rebuilt and
 # updated in place forever. Do not add it here.
+
+# Only used by tools/score-test, never shipped.
+node_modules/

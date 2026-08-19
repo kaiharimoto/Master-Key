@@ -31,6 +31,23 @@ jobs:
       - name: Unit tests
         run: ./gradlew :core:test :app:testDebugUnitTest --no-daemon
 
+      # The scheduler queues are pure standard C++ on purpose, so the ordering
+      # rules the audio callback depends on can be checked without a device.
+      - name: Scheduler queue tests
+        run: |
+          c++ -std=c++17 -Wall -Wextra -o "$RUNNER_TEMP/event_queue_test" \
+            audio/src/main/cpp/test/event_queue_test.cpp
+          "$RUNNER_TEMP/event_queue_test"
+
+      # Drives the real Verovio build and the real score.js through jsdom. The
+      # score pane fails silently when it fails at all — it catches its own
+      # errors and shows "this score could not be read" — so nothing else here
+      # would notice it had stopped rendering.
+      - name: Score pane tests
+        run: |
+          npm --prefix tools/score-test ci --no-audit --no-fund
+          node tools/score-test/scorepane.test.mjs
+
       - name: Assemble release APK
         run: ./gradlew :app:assembleRelease --no-daemon
 

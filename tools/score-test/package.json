@@ -1,0 +1,12 @@
+{
+  "name": "masterkey-score-test",
+  "private": true,
+  "description": "Host-side test for the Verovio score pane. Not shipped in the APK.",
+  "type": "module",
+  "scripts": {
+    "test": "node scorepane.test.mjs"
+  },
+  "devDependencies": {
+    "jsdom": "^27.0.0"
+  }
+}

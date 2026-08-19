@@ -138,6 +138,7 @@ private fun PlayerContent(
                         scaffold = state.settings,
                         positionProvider = viewModel::positionTicks,
                         modifier = Modifier.fillMaxSize(),
+                        onEvent = viewModel::onScoreEvent,
                     )
                 }
 
