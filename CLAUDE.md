@@ -21,13 +21,24 @@ git tag v1.1.0 && git push origin v1.1.0   # publishes a real release
 ```
 
 A tag push builds a signed APK and publishes it as a real GitHub release, which
-is what the in-app updater looks for. The manual **Release** workflow run is the
-other route, but it defaults to a *prerelease*, and `/releases/latest` ignores
-those — so the installed app will never offer it. Only use it when deliberately
-exercising the pipeline rather than shipping.
+is what the in-app updater looks for.
 
-Wait for the release workflow to finish and report the release URL. If it fails,
-fix it and cut the next version — never retag.
+**If the tag push is rejected with a 403** — Claude Code's git proxy allows
+branch pushes but not tag pushes — dispatch the **Release** workflow instead. It
+creates the tag itself, so it is a complete release path on its own:
+
+```
+run_workflow release.yml, ref=main, inputs={version: "1.1.0", prerelease: "false"}
+```
+
+`prerelease` **must** be set to false. It defaults to true, and
+`/releases/latest` ignores prereleases, so the installed app would never be
+offered the build. Only leave it true when deliberately exercising the pipeline
+rather than shipping.
+
+Wait for the release workflow to finish, confirm `/releases/latest` is the new
+version with the APK attached, and report the release URL. If it fails, fix it
+and cut the next version — never retag.
 
 ## Versions
 
