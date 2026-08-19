@@ -271,6 +271,43 @@ class MusicXmlParserTest {
         assertThat(doc.soundingNotes.single().onset).isEqualTo(4)
     }
 
+    /**
+     * Every MusicXML export names a DTD in its DOCTYPE, and none of them need it.
+     *
+     * A parser that goes looking for `musicxml.org` fails on a tablet that is
+     * offline and hangs on one that is merely slow — and because the caller only
+     * uses this for hand and fingering hints, the throw used to be swallowed
+     * whole. The score then never reached the engraver and the pane rendered as
+     * an unexplained black rectangle.
+     *
+     * There is no network here to fail against, so what this pins down is that
+     * the document parses at all with the DOCTYPE present, on whichever SAX
+     * implementation is underneath.
+     */
+    @Test
+    fun `parses a document that declares the MusicXML DTD`() {
+        val withDoctype = """
+            <?xml version="1.0" encoding="UTF-8"?>
+            <!DOCTYPE score-partwise PUBLIC "-//Recordare//DTD MusicXML 4.0 Partwise//EN"
+                "http://www.musicxml.org/dtds/partwise.dtd">
+            <score-partwise version="4.0">
+              <work><work-title>Doctyped</work-title></work>
+              <part-list><score-part id="P1"><part-name>Piano</part-name></score-part></part-list>
+              <part id="P1">
+                <measure number="1">
+                  <attributes><divisions>2</divisions></attributes>
+                  <note><pitch><step>G</step><octave>4</octave></pitch><duration>2</duration></note>
+                </measure>
+              </part>
+            </score-partwise>
+        """.trimIndent()
+
+        val doc = MusicXmlParser.parse(withDoctype.toByteArray())
+
+        assertThat(doc.title).isEqualTo("Doctyped")
+        assertThat(doc.soundingNotes.map { it.pitch }).containsExactly(67)
+    }
+
     @Test
     fun `reads a tempo direction`() {
         val doc = MusicXmlParser.parse(

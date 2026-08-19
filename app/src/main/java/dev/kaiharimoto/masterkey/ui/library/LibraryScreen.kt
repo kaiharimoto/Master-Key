@@ -69,6 +69,7 @@ import dev.kaiharimoto.masterkey.R
 import dev.kaiharimoto.masterkey.data.ImportResult
 import dev.kaiharimoto.masterkey.data.SongEntity
 import dev.kaiharimoto.masterkey.data.SongRepository
+import dev.kaiharimoto.masterkey.ui.player.formatDuration
 import dev.kaiharimoto.masterkey.ui.theme.HandColors
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -81,7 +82,6 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
-import java.util.concurrent.TimeUnit
 
 /**
  * Library loading, modelled explicitly so storage problems are recoverable.
@@ -525,13 +525,6 @@ private fun RangeSwatch(song: SongEntity) {
 }
 
 private val trackColor = Color(0xFF262B36)
-
-private fun formatDuration(micros: Long): String {
-    val totalSeconds = TimeUnit.MICROSECONDS.toSeconds(micros)
-    val minutes = totalSeconds / 60
-    val seconds = totalSeconds % 60
-    return "%d:%02d".format(minutes, seconds)
-}
 
 @Composable
 private fun stringResourceSafe(id: Int): String =

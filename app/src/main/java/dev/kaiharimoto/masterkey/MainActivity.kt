@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.view.KeyEvent
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -14,11 +15,14 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.ui.Modifier
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import dev.kaiharimoto.masterkey.ui.library.LibraryScreen
+import dev.kaiharimoto.masterkey.ui.player.KeyDispatcher
+import dev.kaiharimoto.masterkey.ui.player.LocalKeyDispatcher
 import dev.kaiharimoto.masterkey.ui.player.PlayerScreen
 import dev.kaiharimoto.masterkey.ui.settings.SettingsScreen
 import dev.kaiharimoto.masterkey.ui.theme.MasterKeyTheme
@@ -27,6 +31,18 @@ class MainActivity : ComponentActivity() {
 
     private val requestNotifications =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
+
+    /**
+     * Hardware keys, routed before the window dispatches them.
+     *
+     * The score pane is a WebView, and a focused WebView eats space and the
+     * arrow keys before Compose sees them. Intercepting here is the only place
+     * that is reliably ahead of it.
+     */
+    private val keyDispatcher = KeyDispatcher()
+
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean =
+        keyDispatcher.dispatch(event, currentFocus) || super.dispatchKeyEvent(event)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -41,7 +57,9 @@ class MainActivity : ComponentActivity() {
                     modifier = Modifier.fillMaxSize(),
                     color = MaterialTheme.colorScheme.background,
                 ) {
-                    MasterKeyNavHost()
+                    CompositionLocalProvider(LocalKeyDispatcher provides keyDispatcher) {
+                        MasterKeyNavHost()
+                    }
                 }
             }
         }

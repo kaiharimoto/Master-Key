@@ -17,6 +17,8 @@ import dev.kaiharimoto.masterkey.core.model.Hand
 import dev.kaiharimoto.masterkey.core.model.Note
 import dev.kaiharimoto.masterkey.core.model.Piece
 import dev.kaiharimoto.masterkey.core.score.ScoreDocument
+import dev.kaiharimoto.masterkey.data.AppSettings
+import dev.kaiharimoto.masterkey.data.ScorePlacement
 import dev.kaiharimoto.masterkey.data.SongEntity
 import dev.kaiharimoto.masterkey.data.SongRepository
 import dev.kaiharimoto.masterkey.playback.PlaybackService
@@ -43,16 +45,22 @@ data class PlayerUiState(
     val rightHandMuted: Boolean = false,
     val leftHandMuted: Boolean = false,
     val metronomeEnabled: Boolean = false,
-    val countInBars: Int = 1,
+    val countInEnabled: Boolean = false,
     val countingIn: Boolean = false,
     val showScore: Boolean = true,
     val hasScore: Boolean = false,
+    val scorePlacement: ScorePlacement = ScorePlacement.TOP,
     val scoreDocument: ScoreDocument? = null,
-    /** Raw MusicXML handed to the engraver. Null when no score is linked. */
+    /** Raw MusicXML handed to the engraver. Null when it could not be read. */
     val scoreXml: String? = null,
+    /** Why there is no [scoreXml] to engrave, when a score is linked but unusable. */
+    val scoreError: String? = null,
     val currentBar: Int = 1,
     /** Set while the tempo drill is running; null otherwise. */
     val drillStep: Int? = null,
+    /** True while the scrubber is being dragged. */
+    val scrubbing: Boolean = false,
+    val showShortcuts: Boolean = false,
 )
 
 class PlayerViewModel(
@@ -63,6 +71,7 @@ class PlayerViewModel(
     private val graph = (application as MasterKeyApp).graph
     private val repository: SongRepository = graph.songRepository
     private val engine: PlaybackEngine = graph.playbackEngine
+    private val appSettings: AppSettings = graph.settings
 
     private val _state = MutableStateFlow(PlayerUiState())
     val state: StateFlow<PlayerUiState> = _state.asStateFlow()
@@ -76,7 +85,21 @@ class PlayerViewModel(
      * through Compose state would recompose the player on every frame. The value
      * comes from the audio clock, so it cannot drift from what is being heard.
      */
-    fun positionTicks(): Long = engine.positionTickNow()
+    fun positionTicks(): Long = scrubTick ?: engine.positionTickNow()
+
+    /**
+     * Position the scrubber is being dragged to, or null when it is not.
+     *
+     * Overriding the playhead here rather than seeking on every drag frame is
+     * what makes scrubbing cheap: the highway and the score cursor both read
+     * [positionTicks], so both follow the finger for free, while the audio engine
+     * — which tears down and re-anchors its whole schedule on a seek — is asked
+     * exactly once, on release.
+     */
+    @Volatile private var scrubTick: Long? = null
+
+    /** Whether playback should resume when the current scrub ends. */
+    private var resumeAfterScrub = false
 
     init {
         viewModelScope.launch {
@@ -92,7 +115,6 @@ class PlayerViewModel(
                     rightHandMuted = playback.rightHandMuted,
                     leftHandMuted = playback.leftHandMuted,
                     metronomeEnabled = playback.metronomeEnabled,
-                    countInBars = playback.countInBars,
                     countingIn = playback.countingIn,
                     currentBar = _state.value.model?.barNumberAt(playback.positionTick) ?: 1,
                 )
@@ -115,6 +137,17 @@ class PlayerViewModel(
                         PlaybackService.stop(getApplication())
                     }
                 }
+        }
+        viewModelScope.launch {
+            appSettings.scorePlacement.collect {
+                _state.value = _state.value.copy(scorePlacement = it)
+            }
+        }
+        viewModelScope.launch {
+            appSettings.countInEnabled.collect { enabled ->
+                engine.setCountInBars(if (enabled) 1 else 0)
+                _state.value = _state.value.copy(countInEnabled = enabled)
+            }
         }
         // Adaptive key range. Checked a few times a second rather than per frame:
         // the range only changes at section boundaries, and the highway animates
@@ -147,11 +180,15 @@ class PlayerViewModel(
             return
         }
 
-        // When a score is linked it is the better source for two things the MIDI
-        // can only guess at: which hand plays a note, and what fingering is
-        // written. Both come straight from the notation.
+        // Two independent uses of the same file, and they must not be chained.
+        //
+        // The engraver needs the raw XML and nothing else. Our own parser is only
+        // ever a bonus on top — it tells the highway which hand plays a note and
+        // what fingering is written. Gating the first on the second is what left
+        // a linked score rendering as an unexplained black rectangle: one throw
+        // inside a SAX handler and the notation silently never arrived.
+        val scoreXml = if (song.scoreFileName != null) repository.scoreXml(song) else null
         val score = repository.loadScore(song)
-        val scoreXml = if (score != null) repository.scoreXml(song) else null
         piece = if (score != null) enrichWithScore(loaded, score) else loaded
 
         engine.load(piece)
@@ -180,7 +217,7 @@ class PlayerViewModel(
         engine.setHandMuted(Hand.RIGHT, song.rightHandMuted)
         engine.setHandMuted(Hand.LEFT, song.leftHandMuted)
         engine.setMetronomeEnabled(song.metronomeEnabled)
-        engine.setCountInBars(song.countInBars)
+        engine.setCountInBars(if (appSettings.countInEnabled.value) 1 else 0)
 
         _state.value = PlayerUiState(
             loading = false,
@@ -194,11 +231,14 @@ class PlayerViewModel(
             rightHandMuted = song.rightHandMuted,
             leftHandMuted = song.leftHandMuted,
             metronomeEnabled = song.metronomeEnabled,
-            countInBars = song.countInBars,
             showScore = song.showScore && song.scoreFileName != null,
             hasScore = song.scoreFileName != null,
+            scorePlacement = appSettings.scorePlacement.value,
+            countInEnabled = appSettings.countInEnabled.value,
             scoreDocument = score,
-            scoreXml = scoreXml,
+            scoreXml = scoreXml?.getOrNull(),
+            scoreError = scoreXml?.exceptionOrNull()
+                ?.let { describeScoreFailure(song.scoreFileName, it) },
         )
 
         repository.touch(songId)
@@ -257,6 +297,47 @@ class PlayerViewModel(
 
     fun seekTo(tick: Long) = engine.seek(tick)
 
+    /** Jumps [delta] bars from wherever the playhead is now. */
+    fun seekByBars(delta: Int) {
+        val model = _state.value.model ?: return
+        val bar = (model.barNumberAt(positionTicks()) + delta).coerceIn(1, model.barCount)
+        engine.seek(model.tickOfBar(bar))
+    }
+
+    fun seekToEnd() = engine.seek(piece.endTick)
+
+    /**
+     * Takes the playhead under manual control.
+     *
+     * Playback stops for the duration. Seeking on every drag frame would ask the
+     * engine to discard and rebuild its whole event schedule sixty times a
+     * second, which sounds like a machine gun and does no one any good; holding
+     * the position here instead lets the highway and the score scroll smoothly
+     * under the finger, and the audio picks up wherever it is dropped.
+     */
+    fun beginScrub() {
+        resumeAfterScrub = _state.value.isPlaying
+        if (resumeAfterScrub) engine.pause()
+        scrubTick = engine.positionTickNow()
+        _state.value = _state.value.copy(scrubbing = true)
+    }
+
+    fun updateScrub(tick: Long) {
+        if (!_state.value.scrubbing) return
+        scrubTick = tick.coerceIn(0L, piece.endTick)
+    }
+
+    fun endScrub() {
+        val target = scrubTick ?: return
+        scrubTick = null
+        _state.value = _state.value.copy(scrubbing = false)
+        engine.seek(target)
+        if (resumeAfterScrub) {
+            resumeAfterScrub = false
+            engine.resume()
+        }
+    }
+
     fun setTempoScale(scale: Float) {
         engine.setTempoScale(scale)
         persist { it.copy(tempoScale = scale) }
@@ -282,10 +363,20 @@ class PlayerViewModel(
         persist { it.copy(metronomeEnabled = enabled) }
     }
 
-    fun toggleCountIn() {
-        val bars = if (_state.value.countInBars > 0) 0 else 1
-        engine.setCountInBars(bars)
-        persist { it.copy(countInBars = bars) }
+    fun toggleCountIn() = appSettings.setCountInEnabled(!_state.value.countInEnabled)
+
+    fun setScorePlacement(placement: ScorePlacement) = appSettings.setScorePlacement(placement)
+
+    fun moveScoreLeft() = appSettings.setScorePlacement(_state.value.scorePlacement.movedLeft())
+
+    fun moveScoreRight() = appSettings.setScorePlacement(_state.value.scorePlacement.movedRight())
+
+    fun toggleShortcuts() {
+        _state.value = _state.value.copy(showShortcuts = !_state.value.showShortcuts)
+    }
+
+    fun hideShortcuts() {
+        if (_state.value.showShortcuts) _state.value = _state.value.copy(showShortcuts = false)
     }
 
     fun setScaffoldLevel(level: ScaffoldLevel) {
@@ -378,6 +469,20 @@ class PlayerViewModel(
 
     fun stopTempoDrill() {
         _state.value = _state.value.copy(drillStep = null)
+    }
+
+    /**
+     * Turns a read failure into something worth putting on screen.
+     *
+     * The pane used to show nothing at all when this happened, which is
+     * indistinguishable from a feature that was never built — so whatever we say
+     * here, it has to name the file and say what went wrong with it.
+     */
+    private fun describeScoreFailure(fileName: String?, error: Throwable): String {
+        val name = fileName ?: "The sheet music file"
+        val reason = error.message?.takeIf { it.isNotBlank() } ?: error::class.simpleName.orEmpty()
+        Log.w(TAG, "couldn't load $name for engraving", error)
+        return "$name couldn't be read.\n$reason"
     }
 
     private fun persist(transform: (SongEntity) -> SongEntity) {

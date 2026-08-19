@@ -124,6 +124,20 @@ class PlaybackEngine(private val context: Context) {
     }
 
     /**
+     * Starts playing without a count-in.
+     *
+     * For picking up where something left off — after scrubbing, say. A count-in
+     * answers "get me ready to play from here", which is a question you asked
+     * when you pressed play, not one you asked by letting go of the scrubber.
+     */
+    fun resume() {
+        scope.launch {
+            if (!synth.isCreated || piece.notes.isEmpty()) return@launch
+            startPlaying(withCountIn = false)
+        }
+    }
+
+    /**
      * Starts the transport, optionally after a bar of clicks.
      *
      * The count-in is implemented by anchoring the tick-to-frame mapping ahead of

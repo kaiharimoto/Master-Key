@@ -1,6 +1,7 @@
 package dev.kaiharimoto.masterkey.ui.player
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -8,6 +9,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -41,7 +43,9 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.movableContentOf
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -57,6 +61,7 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import dev.kaiharimoto.masterkey.core.model.Hand
+import dev.kaiharimoto.masterkey.data.ScorePlacement
 import dev.kaiharimoto.masterkey.ui.score.ScorePane
 import dev.kaiharimoto.masterkey.ui.theme.HandColors
 import dev.kaiharimoto.masterkey.ui.theme.HighwayColors
@@ -69,6 +74,17 @@ fun PlayerScreen(
     viewModel: PlayerViewModel = viewModel(factory = PlayerViewModel.factory(songId)),
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
+
+    // Shortcuts are live only while the player is on screen; the dispatcher sits
+    // in the activity because a focused WebView would otherwise eat the keys.
+    val dispatcher = LocalKeyDispatcher.current
+    DisposableEffect(dispatcher, viewModel, onBack) {
+        val handler: (android.view.KeyEvent) -> Boolean = { event ->
+            handleShortcut(event, viewModel, onBack)
+        }
+        dispatcher?.register(handler)
+        onDispose { dispatcher?.unregister(handler) }
+    }
 
     Box(
         Modifier
@@ -84,8 +100,83 @@ fun PlayerScreen(
 
             else -> PlayerContent(state, viewModel, onBack)
         }
+
+        if (state.showShortcuts) ShortcutLegend(onDismiss = viewModel::hideShortcuts)
     }
 }
+
+/**
+ * Maps a hardware key to a transport action.
+ *
+ * Returns true when the key was ours, so it goes no further. Auto-repeat is
+ * allowed through for seeking and tempo — holding an arrow should scan — but
+ * suppressed for the toggles, where a held key would flap the setting.
+ */
+private fun handleShortcut(
+    event: android.view.KeyEvent,
+    viewModel: PlayerViewModel,
+    onBack: () -> Unit,
+): Boolean {
+    val state = viewModel.state.value
+    val repeated = event.repeatCount > 0
+    val shifted = event.isShiftPressed
+
+    fun once(action: () -> Unit): Boolean {
+        if (!repeated) action()
+        return true
+    }
+
+    // With the legend up, nothing else should fire — pressing a key to read what
+    // it does, and having it happen behind the overlay, is a nasty surprise.
+    if (state.showShortcuts) {
+        return when (event.keyCode) {
+            android.view.KeyEvent.KEYCODE_I,
+            android.view.KeyEvent.KEYCODE_ESCAPE,
+            -> once(viewModel::hideShortcuts)
+            else -> true
+        }
+    }
+
+    return when (event.keyCode) {
+        android.view.KeyEvent.KEYCODE_SPACE -> once(viewModel::togglePlay)
+        android.view.KeyEvent.KEYCODE_DPAD_LEFT -> {
+            viewModel.seekByBars(if (shifted) -4 else -1); true
+        }
+        android.view.KeyEvent.KEYCODE_DPAD_RIGHT -> {
+            viewModel.seekByBars(if (shifted) 4 else 1); true
+        }
+        android.view.KeyEvent.KEYCODE_MOVE_HOME -> once(viewModel::restart)
+        android.view.KeyEvent.KEYCODE_MOVE_END -> once(viewModel::seekToEnd)
+        android.view.KeyEvent.KEYCODE_DPAD_UP -> {
+            viewModel.setTempoScale(state.tempoScale + TEMPO_STEP); true
+        }
+        android.view.KeyEvent.KEYCODE_DPAD_DOWN -> {
+            viewModel.setTempoScale(state.tempoScale - TEMPO_STEP); true
+        }
+        android.view.KeyEvent.KEYCODE_R -> once { viewModel.toggleHand(Hand.RIGHT) }
+        android.view.KeyEvent.KEYCODE_L -> once { viewModel.toggleHand(Hand.LEFT) }
+        android.view.KeyEvent.KEYCODE_C -> once {
+            if (state.loop != null) viewModel.clearLoop() else viewModel.loopCurrentBar()
+        }
+        android.view.KeyEvent.KEYCODE_M -> once(viewModel::toggleMetronome)
+        android.view.KeyEvent.KEYCODE_N -> once(viewModel::toggleCountIn)
+        android.view.KeyEvent.KEYCODE_S -> once(viewModel::toggleScore)
+        android.view.KeyEvent.KEYCODE_LEFT_BRACKET -> once(viewModel::moveScoreLeft)
+        android.view.KeyEvent.KEYCODE_RIGHT_BRACKET -> once(viewModel::moveScoreRight)
+        android.view.KeyEvent.KEYCODE_D -> once(viewModel::advanceTempoDrill)
+        android.view.KeyEvent.KEYCODE_A -> once {
+            val levels = ScaffoldLevel.entries
+            val next = levels[(levels.indexOf(state.settings.level) + 1) % levels.size]
+            viewModel.setScaffoldLevel(next)
+        }
+        android.view.KeyEvent.KEYCODE_I -> once(viewModel::toggleShortcuts)
+        android.view.KeyEvent.KEYCODE_ESCAPE -> once(onBack)
+        else -> false
+    }
+}
+
+/** 5% a press: fine enough to creep up on a passage, coarse enough to be felt. */
+private const val TEMPO_STEP = 0.05f
 
 @Composable
 private fun ErrorState(message: String, onBack: () -> Unit) {
@@ -115,6 +206,46 @@ private fun PlayerContent(
     // are comfortable at once; in portrait the highway wants most of the height.
     var scoreWeight by remember { mutableFloatStateOf(0.42f) }
     val showScore = state.showScore && state.hasScore
+    val placement = state.scorePlacement
+
+    // movableContentOf, not plain lambdas: moving the score from above the
+    // highway to beside it swaps a Column for a Row, and an ordinary composable
+    // called from a different place in the tree is a *new* composable — its
+    // remembered state is thrown away and rebuilt. For the score pane that means
+    // destroying the WebView and reloading seven megabytes of Verovio every time
+    // the layout is nudged. This keeps both panes alive across the move.
+    val score = remember {
+        movableContentOf { paneModifier: Modifier ->
+            Box(paneModifier) {
+                ScorePane(
+                    scoreXml = state.scoreXml,
+                    piece = model.piece,
+                    scaffold = state.settings,
+                    positionProvider = viewModel::positionTicks,
+                    modifier = Modifier.fillMaxSize(),
+                    loadError = state.scoreError,
+                    onEvent = viewModel::onScoreEvent,
+                )
+            }
+        }
+    }
+    val highway = remember {
+        movableContentOf { paneModifier: Modifier ->
+            NoteHighway(
+                model = model,
+                range = state.range,
+                settings = state.settings,
+                positionProvider = viewModel::positionTicks,
+                loopStartTick = state.loop?.startTick,
+                loopEndTick = state.loop?.endTick,
+                onSeekToTick = viewModel::seekTo,
+                modifier = paneModifier,
+            )
+        }
+    }
+    val clampedScore = scoreWeight.coerceIn(0.15f, 0.75f)
+    val clampedHighway = (1f - scoreWeight).coerceIn(0.25f, 0.85f)
+    val onSplitDrag = { delta: Float -> scoreWeight = (scoreWeight + delta).coerceIn(0.15f, 0.75f) }
 
     // Status bar is handled here; the transport bar consumes the navigation bar
     // itself so it can keep its background running to the bottom edge.
@@ -125,68 +256,64 @@ private fun PlayerContent(
     ) {
         TopBar(state, viewModel, onBack)
 
-        Column(Modifier.weight(1f)) {
-            if (showScore) {
-                Box(
-                    Modifier
-                        .fillMaxWidth()
-                        .weight(scoreWeight.coerceIn(0.15f, 0.75f)),
-                ) {
-                    ScorePane(
-                        scoreXml = state.scoreXml,
-                        piece = model.piece,
-                        scaffold = state.settings,
-                        positionProvider = viewModel::positionTicks,
-                        modifier = Modifier.fillMaxSize(),
-                        onEvent = viewModel::onScoreEvent,
-                    )
+        Box(Modifier.weight(1f)) {
+            when {
+                !showScore -> highway(Modifier.fillMaxSize())
+
+                placement == ScorePlacement.TOP -> Column(Modifier.fillMaxSize()) {
+                    score(Modifier.fillMaxWidth().weight(clampedScore))
+                    SplitHandle(vertical = true, onDrag = onSplitDrag)
+                    highway(Modifier.fillMaxWidth().weight(clampedHighway))
                 }
 
-                SplitHandle(
-                    onDrag = { delta -> scoreWeight = (scoreWeight + delta).coerceIn(0.15f, 0.75f) },
-                )
+                else -> Row(Modifier.fillMaxSize()) {
+                    // Side by side, the drag runs the other way — and on the
+                    // right the score is after the handle, so widening it means
+                    // dragging left. Negating keeps "drag towards the score to
+                    // make it bigger" true in both arrangements.
+                    if (placement == ScorePlacement.LEFT) {
+                        score(Modifier.fillMaxHeight().weight(clampedScore))
+                        SplitHandle(vertical = false, onDrag = onSplitDrag)
+                        highway(Modifier.fillMaxHeight().weight(clampedHighway))
+                    } else {
+                        highway(Modifier.fillMaxHeight().weight(clampedHighway))
+                        SplitHandle(vertical = false, onDrag = { onSplitDrag(-it) })
+                        score(Modifier.fillMaxHeight().weight(clampedScore))
+                    }
+                }
             }
-
-            NoteHighway(
-                model = model,
-                range = state.range,
-                settings = state.settings,
-                positionProvider = viewModel::positionTicks,
-                loopStartTick = state.loop?.startTick,
-                loopEndTick = state.loop?.endTick,
-                onSeekToTick = viewModel::seekTo,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .weight(if (showScore) (1f - scoreWeight).coerceIn(0.25f, 0.85f) else 1f),
-            )
         }
 
-        TransportBar(state, viewModel)
+        TransportBar(state, viewModel, model)
     }
 }
 
+/**
+ * The draggable divider between the two panes.
+ *
+ * [vertical] describes the split, not the handle: a vertical split stacks the
+ * panes and is dragged up and down, a horizontal one sits them side by side.
+ */
 @Composable
-private fun SplitHandle(onDrag: (Float) -> Unit) {
-    var height by remember { mutableFloatStateOf(1f) }
+private fun SplitHandle(vertical: Boolean, onDrag: (Float) -> Unit) {
     Box(
         Modifier
-            .fillMaxWidth()
-            .height(14.dp)
+            .then(if (vertical) Modifier.fillMaxWidth().height(14.dp) else Modifier.fillMaxHeight().width(14.dp))
             .background(Color(0xFF11141A))
-            .pointerInput(Unit) {
-                height = size.height.toFloat()
-                detectVerticalDragGestures { _, dragAmount ->
-                    // Convert to a fraction of the container so the drag tracks
-                    // the finger regardless of screen size.
-                    onDrag(dragAmount / 900f)
+            .pointerInput(vertical) {
+                // Converted to a fraction of a nominal container so the drag
+                // tracks the finger at roughly the same rate on any screen.
+                if (vertical) {
+                    detectVerticalDragGestures { _, dragAmount -> onDrag(dragAmount / 900f) }
+                } else {
+                    detectHorizontalDragGestures { _, dragAmount -> onDrag(dragAmount / 1400f) }
                 }
             },
         contentAlignment = Alignment.Center,
     ) {
         Box(
             Modifier
-                .width(44.dp)
-                .height(3.dp)
+                .then(if (vertical) Modifier.width(44.dp).height(3.dp) else Modifier.width(3.dp).height(44.dp))
                 .clip(RoundedCornerShape(2.dp))
                 .background(Color(0xFF3A4152)),
         )
@@ -229,6 +356,16 @@ private fun TopBar(state: PlayerUiState, viewModel: PlayerViewModel, onBack: () 
                     tint = if (state.showScore) HandColors.amber else Color(0xFF7A8496),
                 )
             }
+        }
+
+        // The shortcuts exist whether or not a keyboard is attached, so they
+        // need a way in that does not require already knowing the key.
+        IconButton(onClick = viewModel::toggleShortcuts) {
+            Text(
+                "⌘",
+                color = if (state.showShortcuts) HandColors.amber else Color(0xFF7A8496),
+                fontSize = 17.sp,
+            )
         }
 
         ScaffoldMenu(state, viewModel)
@@ -310,22 +447,47 @@ private fun ScaffoldMenu(state: PlayerUiState, viewModel: PlayerViewModel) {
 
             DropdownMenuItem(
                 text = {
-                    Text(
-                        if (state.countInBars > 0) {
-                            "Count-in: one bar"
-                        } else {
-                            "Count-in: off"
-                        },
-                    )
+                    Text(if (state.countInEnabled) "Count-in: one bar" else "Count-in: off")
                 },
                 onClick = {
                     viewModel.toggleCountIn()
                     expanded = false
                 },
                 trailingIcon = {
-                    if (state.countInBars > 0) {
+                    if (state.countInEnabled) {
                         Icon(Icons.Default.PlayArrow, contentDescription = null)
                     }
+                },
+            )
+
+            if (state.hasScore) {
+                Text(
+                    "Sheet music",
+                    style = MaterialTheme.typography.labelMedium,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                ScorePlacement.entries.forEach { placement ->
+                    DropdownMenuItem(
+                        text = { Text(placement.label) },
+                        onClick = {
+                            viewModel.setScorePlacement(placement)
+                            expanded = false
+                        },
+                        trailingIcon = {
+                            if (state.scorePlacement == placement) {
+                                Icon(Icons.Default.PlayArrow, contentDescription = null)
+                            }
+                        },
+                    )
+                }
+            }
+
+            DropdownMenuItem(
+                text = { Text("Keyboard shortcuts") },
+                onClick = {
+                    viewModel.toggleShortcuts()
+                    expanded = false
                 },
             )
 
@@ -355,7 +517,7 @@ private fun ScaffoldMenu(state: PlayerUiState, viewModel: PlayerViewModel) {
 }
 
 @Composable
-private fun TransportBar(state: PlayerUiState, viewModel: PlayerViewModel) {
+private fun TransportBar(state: PlayerUiState, viewModel: PlayerViewModel, model: HighwayModel) {
     Column(
         Modifier
             .fillMaxWidth()
@@ -363,6 +525,18 @@ private fun TransportBar(state: PlayerUiState, viewModel: PlayerViewModel) {
             .windowInsetsPadding(WindowInsets.navigationBars)
             .padding(horizontal = 10.dp, vertical = 8.dp),
     ) {
+        Scrubber(
+            model = model,
+            positionProvider = viewModel::positionTicks,
+            endTick = model.piece.endTick,
+            loopStartTick = state.loop?.startTick,
+            loopEndTick = state.loop?.endTick,
+            onScrubStart = viewModel::beginScrub,
+            onScrub = viewModel::updateScrub,
+            onScrubEnd = viewModel::endScrub,
+            modifier = Modifier.padding(bottom = 4.dp),
+        )
+
         Row(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(6.dp),

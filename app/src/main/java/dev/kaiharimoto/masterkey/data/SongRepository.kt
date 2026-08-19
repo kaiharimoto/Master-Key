@@ -3,6 +3,7 @@ package dev.kaiharimoto.masterkey.data
 import android.content.Context
 import android.net.Uri
 import android.provider.OpenableColumns
+import android.util.Log
 import dev.kaiharimoto.masterkey.core.keyboard.KeyRangeSelector
 import dev.kaiharimoto.masterkey.core.library.LibraryScanner
 import dev.kaiharimoto.masterkey.core.library.SongManifest
@@ -144,12 +145,20 @@ class SongRepository(
         }
     }
 
-    /** Parses the linked MusicXML, if there is one. */
+    /**
+     * Parses the linked MusicXML, if there is one.
+     *
+     * Only ever used to *enrich* the MIDI with staff and fingering. Failing here
+     * costs those two annotations and nothing else — in particular it must not
+     * stop the score being engraved, which needs the raw XML and not this.
+     */
     suspend fun loadScore(song: SongEntity): ScoreDocument? = withContext(Dispatchers.IO) {
         val name = song.scoreFileName ?: return@withContext null
         val file = File(File(libraryRoot, song.folder), name)
         if (!file.exists()) return@withContext null
-        runCatching { MusicXmlParser.parse(file) }.getOrNull()
+        runCatching { MusicXmlParser.parse(file) }
+            .onFailure { Log.w(TAG, "couldn't parse $name for hand/fingering data", it) }
+            .getOrNull()
     }
 
     /**
@@ -159,10 +168,13 @@ class SongRepository(
      * the renderer receives plain MusicXML either way and does not need to care
      * which form the user supplied.
      */
-    suspend fun scoreXml(song: SongEntity): String? = withContext(Dispatchers.IO) {
-        val name = song.scoreFileName ?: return@withContext null
+    suspend fun scoreXml(song: SongEntity): Result<String> = withContext(Dispatchers.IO) {
+        val name = song.scoreFileName
+            ?: return@withContext Result.failure(IllegalStateException("No sheet music is linked."))
         val file = File(File(libraryRoot, song.folder), name)
-        if (!file.exists()) return@withContext null
+        if (!file.exists()) {
+            return@withContext Result.failure(IllegalStateException("$name is missing from the library."))
+        }
 
         runCatching {
             if (name.endsWith(".mxl", ignoreCase = true)) {
@@ -170,7 +182,7 @@ class SongRepository(
             } else {
                 file.readText()
             }
-        }.getOrNull()
+        }.onFailure { Log.w(TAG, "couldn't read $name", it) }
     }
 
     fun scoreFile(song: SongEntity): File? {
@@ -329,6 +341,10 @@ class SongRepository(
     private fun isMidi(name: String) = extension(name) in setOf("mid", "midi", "smf")
 
     private fun isScore(name: String) = extension(name) in setOf("musicxml", "mxl", "xml")
+
+    private companion object {
+        const val TAG = "MasterKeyLibrary"
+    }
 
     /**
      * Turns `Fur_Elise-Beethoven.mid` into `Fur Elise Beethoven`.

@@ -72,8 +72,10 @@ const doc = win.document;
 
 // jsdom does no layout, so element sizes read zero. Give the pane a tablet-sized
 // viewport, which is what decides how Verovio paginates.
-Object.defineProperty(doc.getElementById('viewport'), 'clientWidth', { value: 1200 });
-Object.defineProperty(doc.getElementById('viewport'), 'clientHeight', { value: 520 });
+const PANE_WIDTH = 1200;
+const PANE_HEIGHT = 520;
+Object.defineProperty(doc.getElementById('viewport'), 'clientWidth', { value: PANE_WIDTH });
+Object.defineProperty(doc.getElementById('viewport'), 'clientHeight', { value: PANE_HEIGHT });
 
 const events = [];
 win.MasterKey = { onScoreEvent: (payload) => events.push(JSON.parse(payload)) };
@@ -95,7 +97,8 @@ await new Promise((resolve, reject) => {
 
 check(true, 'engraver reports ready');
 
-win.MasterKeyScore.load(sampleScore(24));
+const BARS = 80;
+win.MasterKeyScore.load(sampleScore(BARS));
 
 const loaded = events.find((e) => e.type === 'loaded');
 const errors = events.filter((e) => e.type === 'error');
@@ -108,6 +111,27 @@ if (!loaded) {
 check(loaded.events > 0, `the timemap has entries (${loaded.events})`);
 check(loaded.pages > 1, `the score paginates (${loaded.pages} pages)`);
 check(doc.getElementById('status').classList.contains('hidden'), 'the status message is cleared');
+
+// The engraved page must be as wide as the pane it is being drawn into.
+// Dividing pageWidth by 100 instead of by the scale engraved it at 40% of the
+// pane and left it stranded in the top-left corner — which is most of why a
+// linked score looked like an empty black rectangle.
+const svg = doc.querySelector('#page svg');
+const viewBox = svg && svg.getAttribute('viewBox');
+check(!!viewBox, `the SVG carries a viewBox, so width:100% scales the notation (${viewBox})`);
+const engravedWidth = viewBox ? Number(viewBox.split(/\s+/)[2]) : 0;
+check(
+  Math.abs(engravedWidth - PANE_WIDTH) <= 1,
+  `the engraved page fills the pane (${engravedWidth} for a ${PANE_WIDTH}px pane)`,
+);
+
+// Every measure is dimmed relative to the current one, so a score with nothing
+// current renders entirely at the dimmed level — dark enough on #0d0f14 to read
+// as blank. Bar one has to be lit before the cursor ever moves.
+check(
+  doc.querySelector('.measure.mk-current') !== null,
+  'a bar is highlighted on load, before any cursor update',
+);
 
 const right = doc.querySelectorAll('.note.mk-right').length;
 const left = doc.querySelectorAll('.note.mk-left').length;
@@ -126,7 +150,7 @@ for (let quarter = 0; quarter <= loaded.lastQstamp; quarter += 0.25) {
   if (lastPage) pagesVisited.add(lastPage.page);
 }
 check(pagesVisited.size === loaded.pages, `every page is turned to (${[...pagesVisited].join(', ')})`);
-check(barsHighlighted.size === 24, `the bar highlight advances through the piece (${barsHighlighted.size} bars)`);
+check(barsHighlighted.size === BARS, `the bar highlight advances through the piece (${barsHighlighted.size} bars)`);
 check(mostSoundingAtOnce >= 4, `chords light up together (${mostSoundingAtOnce} noteheads at once)`);
 
 // Scrubbing backwards has to rebuild the sounding set, not carry it forward.

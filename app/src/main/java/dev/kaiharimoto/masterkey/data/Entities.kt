@@ -47,6 +47,13 @@ data class SongEntity(
     @ColumnInfo(defaultValue = "0") val rightHandMuted: Boolean = false,
     @ColumnInfo(defaultValue = "0") val leftHandMuted: Boolean = false,
     @ColumnInfo(defaultValue = "0") val metronomeEnabled: Boolean = false,
+    /**
+     * Superseded by [AppSettings.countInEnabled] and no longer read.
+     *
+     * Left in place deliberately: dropping a column is a schema change, and a
+     * schema change is the riskiest edit in this app — an unmigrated one is what
+     * crashed v1.0.1 on every launch. An unread column costs nothing.
+     */
     @ColumnInfo(defaultValue = "1") val countInBars: Int = 1,
     @ColumnInfo(defaultValue = "1") val showScore: Boolean = true,
     @ColumnInfo(defaultValue = "8.0") val lookAheadBeats: Float = 8f,

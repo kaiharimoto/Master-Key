@@ -2,6 +2,7 @@ package dev.kaiharimoto.masterkey.di
 
 import android.content.Context
 import dev.kaiharimoto.masterkey.audio.PlaybackEngine
+import dev.kaiharimoto.masterkey.data.AppSettings
 import dev.kaiharimoto.masterkey.data.MasterKeyDatabase
 import dev.kaiharimoto.masterkey.data.SongRepository
 import dev.kaiharimoto.masterkey.update.UpdateRepository
@@ -18,6 +19,9 @@ import dev.kaiharimoto.masterkey.update.UpdateRepository
 class AppGraph(private val context: Context) {
 
     val database: MasterKeyDatabase by lazy { MasterKeyDatabase.create(context) }
+
+    /** Preferences that belong to the app rather than to a piece. */
+    val settings: AppSettings by lazy { AppSettings(context) }
 
     val songRepository: SongRepository by lazy {
         SongRepository(context, database.songDao())

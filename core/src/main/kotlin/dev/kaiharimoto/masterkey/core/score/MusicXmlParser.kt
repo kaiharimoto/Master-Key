@@ -1,6 +1,8 @@
 package dev.kaiharimoto.masterkey.core.score
 
 import org.xml.sax.Attributes
+import org.xml.sax.EntityResolver
+import org.xml.sax.InputSource
 import org.xml.sax.helpers.DefaultHandler
 import java.io.ByteArrayInputStream
 import java.io.File
@@ -51,15 +53,26 @@ object MusicXmlParser {
         val handler = Handler()
         val factory = SAXParserFactory.newInstance().apply {
             isNamespaceAware = false
-            // MusicXML files reference a DTD by URL. Without this the parser tries
-            // to fetch it, which fails offline and hangs on a slow network.
+            // Belt: ask the parser not to go looking for the DTD every MusicXML
+            // file names in its DOCTYPE. These are Xerces feature names, so they
+            // work on the JVM and are quietly rejected on Android, whose parser
+            // is Expat-based — hence the braces, and hence the resolver below.
             runCatching {
                 setFeature("http://apache.org/xml/features/nonvalidating/load-external-dtd", false)
             }
             runCatching { setFeature("http://xml.org/sax/features/external-general-entities", false) }
             runCatching { setFeature("http://xml.org/sax/features/external-parameter-entities", false) }
         }
-        factory.newSAXParser().parse(stream, handler)
+
+        val reader = factory.newSAXParser().xmlReader
+        reader.contentHandler = handler
+        // Braces: whatever the feature flags did or did not take, every external
+        // entity now resolves to nothing. A parser that reaches for
+        // musicxml.org over the network fails on a tablet that is offline, or
+        // hangs on one that is merely slow — and the whole score is lost to a
+        // reference the file does not actually need.
+        reader.entityResolver = EntityResolver { _, _ -> InputSource(ByteArrayInputStream(ByteArray(0))) }
+        reader.parse(InputSource(stream))
         return handler.build()
     }
 

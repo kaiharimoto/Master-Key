@@ -51,13 +51,24 @@
     }
   }
 
+  /**
+   * Engraving scale, as a percentage.
+   *
+   * This same number has to divide the page dimensions below, because Verovio
+   * emits an SVG of `pageWidth * SCALE / 100` pixels. Passing the pane's pixel
+   * width straight through as pageWidth (i.e. dividing by 100 instead of by the
+   * scale) engraves the page at 40% of the pane and breaks the piece across two
+   * and a half times as many pages as it needs.
+   */
+  var SCALE = 40;
+
   function options() {
     return {
       // One page per screenful, laid out to the viewport, rather than one huge
       // SVG — this is what keeps rendering cheap on a tablet.
-      pageWidth: Math.max(600, Math.round(viewportEl.clientWidth * 100 / zoom())),
-      pageHeight: Math.max(400, Math.round(viewportEl.clientHeight * 100 / zoom())),
-      scale: 40,
+      pageWidth: Math.max(600, Math.round(viewportEl.clientWidth * 100 / SCALE)),
+      pageHeight: Math.max(400, Math.round(viewportEl.clientHeight * 100 / SCALE)),
+      scale: SCALE,
       adjustPageHeight: true,
       breaks: 'auto',
       // Times is not on Android; Leipzig ships with Verovio.
@@ -66,15 +77,17 @@
       header: 'none',
       spacingStaff: 10,
       spacingSystem: 8,
+      // A viewBox instead of fixed px dimensions, so `width: 100%` scales the
+      // notation itself rather than just the box around it. Without it the
+      // content keeps its own coordinate system and sits in the top-left corner
+      // whenever the layout and the pane disagree — which they do for the 250 ms
+      // the resize debounce takes to catch up with a split-handle drag.
+      svgViewBox: true,
       // Puts data-n on every <g class="staff">. Nothing else in the SVG says
       // which staff a notehead sits on, and the staff is how the two hands are
       // told apart — without this every note would be coloured right-hand.
       svgAdditionalAttribute: ['staff@n']
     };
-  }
-
-  function zoom() {
-    return 100;
   }
 
   /**
@@ -142,6 +155,10 @@
         lastIndex = -1;
         sounding = {};
         renderPage(1);
+        // Mark bar one straight away. Every measure is dimmed relative to the
+        // current one, so leaving nothing current until the first cursor update
+        // renders the entire score at the dimmed level.
+        updateMeasure(measureAt[0]);
 
         post({
           type: 'loaded',
