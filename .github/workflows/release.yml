@@ -94,7 +94,7 @@ jobs:
       # measures the pixels.
       - name: Score pane renders
         run: |
-          npx --prefix tools/score-test playwright install --with-deps chromium
+          (cd tools/score-test && npx playwright install --with-deps chromium)
           node tools/score-test/render.test.mjs
 
       # No signing secrets: the release keystore is committed on purpose.
