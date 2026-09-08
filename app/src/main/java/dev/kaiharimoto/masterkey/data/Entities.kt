@@ -61,7 +61,21 @@ data class SongEntity(
     /** Highest tempo scale reached in a completed practice run, for progress. */
     @ColumnInfo(defaultValue = "0.0") val bestTempoScale: Float = 0f,
     @ColumnInfo(defaultValue = "0") val totalPracticeMillis: Long = 0,
-)
+) {
+    companion object {
+        /**
+         * [midiFileName] for a song imported from a MusicXML alone.
+         *
+         * A sentinel rather than making the column nullable, deliberately.
+         * Changing a column's nullability is a Room schema change, and a schema
+         * change is the riskiest edit in this app — an unmigrated one is what
+         * crashed v1.0.1 on every launch, behind the in-app updater. An empty
+         * string needs no migration and no schema bump, and the one place that
+         * reads it is [SongRepository.loadPiece].
+         */
+        const val NO_MIDI = ""
+    }
+}
 
 /** A saved loop region, so a hard passage can be returned to across sessions. */
 @Entity(

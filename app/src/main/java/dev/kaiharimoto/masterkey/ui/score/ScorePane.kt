@@ -164,6 +164,10 @@ fun ScorePane(
     // Hand the score over once the engraver reports ready.
     LaunchedEffect(scoreXml, bridge) {
         if (scoreXml == null) return@LaunchedEffect
+        // A second score must not inherit the first one's "loaded", or the
+        // effects waiting on it would push zoom and fingering at a page that is
+        // no longer there.
+        bridge.resetLoaded()
         bridge.awaitReady()
         webView.post {
             webView.evaluateJavascript(
@@ -316,6 +320,10 @@ private class ScoreBridge(private val onEvent: (ScoreEvent) -> Unit) {
 
             "error" -> onEvent(ScoreEvent.Failed(json.optString("message")))
         }
+    }
+
+    fun resetLoaded() {
+        loaded = false
     }
 
     suspend fun awaitReady() {

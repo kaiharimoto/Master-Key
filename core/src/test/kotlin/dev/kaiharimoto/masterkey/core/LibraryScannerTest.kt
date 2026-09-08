@@ -126,8 +126,20 @@ class LibraryScannerTest {
     }
 
     @Test
-    fun `folders with no midi are skipped`() {
-        songFolder("orphan", midi = null, score = "score.musicxml")
+    fun `a folder with only a score is still a song`() {
+        // A MusicXML carries the notes as well as the notation, so it can be
+        // played on its own; requiring a MIDI beside it only hid usable music.
+        songFolder("score-only", midi = null, score = "score.musicxml")
+
+        val found = LibraryScanner.scan(temp.root).single()
+        assertThat(found.midiFile).isNull()
+        assertThat(found.scoreFile?.name).isEqualTo("score.musicxml")
+        assertThat(found.isUsable).isTrue()
+    }
+
+    @Test
+    fun `folders with neither a midi nor a score are skipped`() {
+        songFolder("orphan", midi = null, score = null)
 
         assertThat(LibraryScanner.scan(temp.root)).isEmpty()
     }

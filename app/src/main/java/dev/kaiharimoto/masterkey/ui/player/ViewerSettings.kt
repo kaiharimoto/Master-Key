@@ -159,6 +159,17 @@ fun ViewerSettingsSheet(
             }
 
             Spacer(Modifier.height(10.dp))
+            Heading("Sound")
+            SettingSlider(
+                label = "Volume",
+                value = state.volume,
+                range = 0f..1f,
+                steps = 19,
+                readout = "${(state.volume * 100).roundToInt()}%",
+                onChange = viewModel::setVolume,
+            )
+
+            Spacer(Modifier.height(10.dp))
             Heading("Timing")
             SettingSwitch(
                 label = "Count-in before playing",

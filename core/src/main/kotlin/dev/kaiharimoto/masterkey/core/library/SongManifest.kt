@@ -58,7 +58,13 @@ data class DiscoveredSong(
     val scoreFile: File?,
 ) {
     /** Usable only if there is actually a MIDI file to play. */
-    val isUsable: Boolean get() = midiFile != null
+    /**
+     * A folder worth indexing.
+     *
+     * Either file alone is enough: a MusicXML carries the notes as well as the
+     * notation, so a score-only folder is a playable song, not an orphan.
+     */
+    val isUsable: Boolean get() = midiFile != null || scoreFile != null
 }
 
 /**

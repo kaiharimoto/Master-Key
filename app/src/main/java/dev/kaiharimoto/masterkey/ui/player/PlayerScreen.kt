@@ -50,6 +50,7 @@ import androidx.compose.runtime.movableContentOf
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -62,6 +63,7 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import dev.kaiharimoto.masterkey.core.model.Hand
+import dev.kaiharimoto.masterkey.core.model.Piece
 import dev.kaiharimoto.masterkey.data.ScorePlacement
 import dev.kaiharimoto.masterkey.ui.score.ScorePane
 import dev.kaiharimoto.masterkey.ui.theme.HandColors
@@ -238,17 +240,29 @@ private fun PlayerContent(
     // remembered state is thrown away and rebuilt. For the score pane that means
     // destroying the WebView and reloading seven megabytes of Verovio every time
     // the layout is nudged. This keeps both panes alive across the move.
+    //
+    // But `remember {}` runs its lambda exactly once, so anything the closures
+    // below captured directly would be captured *forever* — and `state` is a
+    // plain value parameter, a snapshot of one composition. That is precisely
+    // what happened: both panes went on being handed the PlayerUiState from the
+    // moment the screen was entered, Compose saw identical arguments and skipped
+    // them, and every view setting appeared to do nothing until you left the
+    // player and came back. Reading through `latest` instead keeps the closures
+    // free of mutable state: rememberUpdatedState hands back one stable holder
+    // whose value is refreshed each composition, so the reads inside are ordinary
+    // snapshot reads and the panes recompose while the WebView survives.
+    val latest by rememberUpdatedState(state)
     val score = remember {
         movableContentOf { paneModifier: Modifier ->
             Box(paneModifier) {
                 ScorePane(
-                    scoreXml = state.scoreXml,
-                    piece = model.piece,
-                    scaffold = state.settings,
+                    scoreXml = latest.scoreXml,
+                    piece = latest.model?.piece ?: Piece.EMPTY,
+                    scaffold = latest.settings,
                     positionProvider = viewModel::positionTicks,
                     modifier = Modifier.fillMaxSize(),
-                    zoom = state.scoreZoom,
-                    loadError = state.scoreError,
+                    zoom = latest.scoreZoom,
+                    loadError = latest.scoreError,
                     onEvent = viewModel::onScoreEvent,
                 )
             }
@@ -257,13 +271,21 @@ private fun PlayerContent(
     val highway = remember {
         movableContentOf { paneModifier: Modifier ->
             NoteHighway(
-                model = model,
-                range = state.range,
-                settings = state.settings,
+                model = latest.model ?: return@movableContentOf,
+                range = latest.range,
+                settings = latest.settings,
                 positionProvider = viewModel::positionTicks,
-                loopStartTick = state.loop?.startTick,
-                loopEndTick = state.loop?.endTick,
+                loopStartTick = latest.loop?.startTick,
+                loopEndTick = latest.loop?.endTick,
                 onSeekToTick = viewModel::seekTo,
+                onKeyTapped = viewModel::strikeKey,
+                // The same three calls the seekbar makes. Routing the drag here
+                // rather than to seekTo is what keeps it live and cheap: the
+                // playhead is overridden for the UI while the engine is left
+                // alone until the finger lifts.
+                onScrubStart = viewModel::beginScrubWithPreview,
+                onScrubTo = viewModel::updateScrub,
+                onScrubEnd = viewModel::endScrub,
                 modifier = paneModifier,
             )
         }
@@ -673,16 +695,28 @@ private fun TempoControl(state: PlayerUiState, viewModel: PlayerViewModel) {
         )
         Spacer(Modifier.width(6.dp))
 
+        // Dragging is tracked locally and committed on release. Every call to
+        // setTempoScale re-anchors the schedule and restarts the transport, so
+        // sending one per drag frame re-articulates whatever is sounding sixty
+        // times a second — the same machine-gun the scrubber was built to avoid.
+        // The readout still follows the finger; only the engine waits.
+        var dragged by remember { mutableStateOf<Float?>(null) }
+        val shown = dragged ?: state.tempoScale
+
         Text(
-            "${(state.tempoScale * 100).roundToInt()}%",
+            "${(shown * 100).roundToInt()}%",
             style = MaterialTheme.typography.labelLarge,
             color = Color(0xFFE3E6EC),
             modifier = Modifier.width(46.dp),
         )
 
         Slider(
-            value = state.tempoScale,
-            onValueChange = viewModel::setTempoScale,
+            value = shown,
+            onValueChange = { dragged = it },
+            onValueChangeFinished = {
+                dragged?.let(viewModel::setTempoScale)
+                dragged = null
+            },
             valueRange = 0.25f..1.25f,
             // 20 steps of 5% — fine enough to be useful, coarse enough to hit.
             steps = 19,

@@ -16,6 +16,14 @@ import kotlinx.coroutines.withContext
 import java.util.concurrent.Executors
 import kotlin.math.roundToLong
 
+/** A note held by the scrub preview or a key tap, with both its exit conditions. */
+private data class PreviewVoice(
+    val channel: Int,
+    /** Where the note was written to stop, in ticks. */
+    val endTick: Long,
+    val startedAtMillis: Long,
+)
+
 /** Loop region in musical time, so it survives tempo changes unchanged. */
 data class LoopRegion(val startTick: Long, val endTick: Long)
 
@@ -92,6 +100,14 @@ class PlaybackEngine(private val context: Context) {
 
     /** Frame at which the music actually begins; earlier frames are count-in. */
     private var countInUntilFrame = 0L
+
+    /** Notes currently ringing from a scrub preview, keyed by pitch. */
+    private val previewVoices = HashMap<Int, PreviewVoice>()
+
+    /** Where the preview playhead last was, so only new ground sounds. */
+    private var lastPreviewTick = 0L
+
+    private var previewJob: Job? = null
 
     suspend fun initialise(soundFontAsset: String = DEFAULT_SOUND_FONT): Boolean =
         withContext(engineDispatcher) {
@@ -285,6 +301,150 @@ class PlaybackEngine(private val context: Context) {
         scope.launch { _state.value = _state.value.copy(metronomeEnabled = enabled) }
     }
 
+    /**
+     * Arms the scrub preview at [tick].
+     *
+     * Seeds the preview playhead so the first drag update sounds only what the
+     * finger actually crosses, rather than every note from the top of the piece.
+     */
+    fun beginPreview(tick: Long) {
+        scope.launch {
+            lastPreviewTick = tick
+            previewVoices.clear()
+            previewJob?.cancel()
+            // Releases are driven from here rather than from the drag, because a
+            // finger held still sends no updates and the note has to stop anyway.
+            previewJob = scope.launch {
+                while (true) {
+                    releaseFinishedPreviewVoices(lastPreviewTick)
+                    delay(PREVIEW_RELEASE_INTERVAL_MS)
+                }
+            }
+        }
+    }
+
+    /**
+     * Sounds the notes the playhead has just crossed, moving forwards.
+     *
+     * Dragging backwards stays silent on purpose: music played in reverse tells
+     * you nothing about the passage, and re-striking on the way back doubles the
+     * note churn for no gain.
+     *
+     * The transport is paused for the whole of a scrub, so the audio clock is
+     * frozen — which is precisely what makes this work. The callback applies
+     * events dated at or before the current frame whether or not it is running,
+     * so an event stamped with the frozen frame sounds on the very next buffer.
+     */
+    fun previewTo(tick: Long) {
+        scope.launch {
+            if (!synth.isCreated || piece.notes.isEmpty() || _state.value.isPlaying) return@launch
+            val from = lastPreviewTick
+            val target = tick.coerceIn(0L, piece.endTick)
+            lastPreviewTick = target
+            releaseFinishedPreviewVoices(target)
+            if (target <= from) return@launch
+
+            val crossed = ArrayList<Note>()
+            var index = firstNoteIndexAtOrAfter(from + 1)
+            while (index < piece.notes.size) {
+                val note = piece.notes[index]
+                index++
+                if (note.startTick > target) break
+                if (isMuted(note.hand)) continue
+                crossed += note
+            }
+
+            // A fling crosses whole phrases between two frames. Sounding all of
+            // them at once is a cluster, not a preview, so only the notes at the
+            // end of the jump — the ones nearest where the finger now is — play.
+            val first = (crossed.size - MAX_PREVIEW_NOTES_PER_STEP).coerceAtLeast(0)
+            val frame = synth.transportFrames()
+            for (i in first until crossed.size) {
+                val note = crossed[i]
+                // A note already ringing is left alone. Re-striking it as the
+                // playhead crawls through would stutter the same key, and a
+                // note-on landing on the frozen frame alongside its own note-off
+                // would be applied second (note-off sorts first) and hang.
+                if (previewVoices.containsKey(note.pitch)) continue
+                synth.scheduleNoteOn(frame, note.hand.synthChannel, note.pitch, note.velocity)
+                previewVoices[note.pitch] = PreviewVoice(
+                    channel = note.hand.synthChannel,
+                    endTick = note.endTick,
+                    startedAtMillis = System.currentTimeMillis(),
+                )
+            }
+        }
+    }
+
+    /** Releases everything the preview is holding and disarms it. */
+    fun endPreview() {
+        scope.launch {
+            previewJob?.cancel()
+            previewJob = null
+            val frame = synth.transportFrames()
+            for ((pitch, voice) in previewVoices) {
+                synth.scheduleNoteOff(frame, voice.channel, pitch)
+            }
+            previewVoices.clear()
+        }
+    }
+
+    /**
+     * Stops preview notes that have run their course.
+     *
+     * Two ways to finish: the playhead passes where the note was written to end,
+     * or the note hits the wall-clock cap. The cap is what stops a slow drag
+     * through a held chord leaving it droning under the finger indefinitely.
+     */
+    private fun releaseFinishedPreviewVoices(tick: Long) {
+        if (previewVoices.isEmpty()) return
+        val now = System.currentTimeMillis()
+        val frame = synth.transportFrames()
+        val iterator = previewVoices.entries.iterator()
+        while (iterator.hasNext()) {
+            val (pitch, voice) = iterator.next()
+            val expired = tick >= voice.endTick || now - voice.startedAtMillis >= PREVIEW_MAX_HOLD_MS
+            if (!expired) continue
+            synth.scheduleNoteOff(frame, voice.channel, pitch)
+            iterator.remove()
+        }
+    }
+
+    private fun isMuted(hand: Hand): Boolean = when (hand) {
+        Hand.RIGHT -> _state.value.rightHandMuted
+        Hand.LEFT -> _state.value.leftHandMuted
+    }
+
+    /**
+     * Sounds one key on its own, for tapping the drawn keyboard.
+     *
+     * Reuses the preview voices so the release timer already running looks after
+     * it, and so a tapped key cannot collide with a scrubbed one.
+     */
+    fun strikeKey(pitch: Int, hand: Hand = Hand.RIGHT) {
+        scope.launch {
+            if (!synth.isCreated || previewVoices.containsKey(pitch)) return@launch
+            val frame = synth.transportFrames()
+            synth.scheduleNoteOn(frame, hand.synthChannel, pitch, KEY_TAP_VELOCITY)
+            previewVoices[pitch] = PreviewVoice(
+                channel = hand.synthChannel,
+                // Never released by the playhead — a tapped key has no place in
+                // the piece, so the wall-clock cap is its only exit.
+                endTick = Long.MAX_VALUE,
+                startedAtMillis = System.currentTimeMillis(),
+            )
+            if (previewJob == null) {
+                previewJob = scope.launch {
+                    while (previewVoices.isNotEmpty()) {
+                        releaseFinishedPreviewVoices(lastPreviewTick)
+                        delay(PREVIEW_RELEASE_INTERVAL_MS)
+                    }
+                    previewJob = null
+                }
+            }
+        }
+    }
+
     fun setMasterVolume(volume: Float) {
         scope.launch { synth.setMasterGain(volume.coerceIn(0f, 1f)) }
     }
@@ -310,6 +470,7 @@ class PlaybackEngine(private val context: Context) {
 
     fun release() {
         schedulerJob?.cancel()
+        previewJob?.cancel()
         scope.launch { synth.destroy() }
         engineThread.shutdown()
     }
@@ -526,5 +687,14 @@ class PlaybackEngine(private val context: Context) {
         /** How far ahead events are queued. Comfortably longer than one pump. */
         private const val LOOKAHEAD_MS = 400L
         private const val SCHEDULER_INTERVAL_MS = 50L
+
+        /** Longest a preview note rings, however slowly the finger moves. */
+        private const val PREVIEW_MAX_HOLD_MS = 600L
+        private const val PREVIEW_RELEASE_INTERVAL_MS = 25L
+
+        /** Most notes one drag step may sound, so a fling is not a cluster. */
+        private const val MAX_PREVIEW_NOTES_PER_STEP = 6
+
+        private const val KEY_TAP_VELOCITY = 80
     }
 }

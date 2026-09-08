@@ -35,6 +35,18 @@ data class ScoreMeasure(
 )
 
 /**
+ * A `<time>` from the score, at the point in divisions where it takes effect.
+ *
+ * Kept in the score's own units rather than converted here: [ScoreDocument] does
+ * not know the tick resolution anything downstream will want to use.
+ */
+data class ScoreTimeSignature(
+    val onset: Long,
+    val numerator: Int,
+    val denominator: Int,
+)
+
+/**
  * The parts of a MusicXML file the app reasons about, independent of whatever
  * engine draws the notation.
  */
@@ -47,6 +59,10 @@ data class ScoreDocument(
     val tempoBpm: Double?,
     val hasFingering: Boolean,
     val hasTwoStaves: Boolean,
+    val timeSignatures: List<ScoreTimeSignature> = emptyList(),
+    /** `<key><fifths>`: negative = flats, positive = sharps. Null when unwritten. */
+    val fifths: Int? = null,
+    val isMinor: Boolean = false,
 ) {
     /** Sounding notes only, in time order — what pairs against MIDI events. */
     val soundingNotes: List<ScoreNote> by lazy {

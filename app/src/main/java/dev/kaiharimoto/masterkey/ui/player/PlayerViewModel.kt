@@ -46,6 +46,7 @@ data class PlayerUiState(
     val leftHandMuted: Boolean = false,
     val metronomeEnabled: Boolean = false,
     val countInEnabled: Boolean = false,
+    val volume: Float = AppSettings.DEFAULT_VOLUME,
     val countingIn: Boolean = false,
     val showScore: Boolean = true,
     val showHighway: Boolean = true,
@@ -114,6 +115,15 @@ class PlayerViewModel(
     /** Whether playback should resume when the current scrub ends. */
     private var resumeAfterScrub = false
 
+    /**
+     * Whether the current scrub sounds the notes it passes.
+     *
+     * Set by the highway, which you drag through the music itself, and not by
+     * the seekbar, which is for jumping across the whole piece — a drag that
+     * covers four minutes in an inch would be a smear, not a preview.
+     */
+    private var previewingScrub = false
+
     init {
         viewModelScope.launch {
             engine.initialise()
@@ -165,6 +175,12 @@ class PlayerViewModel(
         viewModelScope.launch {
             appSettings.keyboardWhiteKeys.collect {
                 _state.value = _state.value.copy(keyboardWhiteKeys = it, range = rangeFor(baseRange, it))
+            }
+        }
+        viewModelScope.launch {
+            appSettings.masterVolume.collect { volume ->
+                engine.setMasterVolume(volume)
+                _state.value = _state.value.copy(volume = volume)
             }
         }
         viewModelScope.launch {
@@ -246,6 +262,7 @@ class PlayerViewModel(
         engine.setHandMuted(Hand.LEFT, song.leftHandMuted)
         engine.setMetronomeEnabled(song.metronomeEnabled)
         engine.setCountInBars(if (appSettings.countInEnabled.value) 1 else 0)
+        engine.setMasterVolume(appSettings.masterVolume.value)
 
         _state.value = PlayerUiState(
             loading = false,
@@ -265,6 +282,7 @@ class PlayerViewModel(
             scoreZoom = appSettings.scoreZoom.value,
             keyboardWhiteKeys = appSettings.keyboardWhiteKeys.value,
             countInEnabled = appSettings.countInEnabled.value,
+            volume = appSettings.masterVolume.value,
             scoreDocument = score,
             scoreXml = scoreXml?.getOrNull(),
             scoreError = scoreXml?.exceptionOrNull()
@@ -345,19 +363,41 @@ class PlayerViewModel(
      * the position here instead lets the highway and the score scroll smoothly
      * under the finger, and the audio picks up wherever it is dropped.
      */
-    fun beginScrub() {
+    fun beginScrub() = startScrub(preview = false)
+
+    /** Drag on the highway: tracks the finger *and* sounds what it crosses. */
+    fun beginScrubWithPreview() = startScrub(preview = true)
+
+    private fun startScrub(preview: Boolean) {
         resumeAfterScrub = _state.value.isPlaying
         if (resumeAfterScrub) engine.pause()
-        scrubTick = engine.positionTickNow()
+        val from = engine.positionTickNow()
+        scrubTick = from
+        previewingScrub = preview
+        // Seeded at the current playhead so the first drag update sounds what
+        // the finger crosses, not everything from the top of the piece.
+        if (preview) engine.beginPreview(from)
         _state.value = _state.value.copy(scrubbing = true)
     }
 
     fun updateScrub(tick: Long) {
         if (!_state.value.scrubbing) return
-        scrubTick = tick.coerceIn(0L, piece.endTick)
+        val target = tick.coerceIn(0L, piece.endTick)
+        scrubTick = target
+        // Hearing the notes go past is most of what makes scrubbing usable for
+        // finding a passage — the highway alone tells you where you are, not
+        // what it is. Silent when dragging backwards; see previewTo.
+        if (previewingScrub) engine.previewTo(target)
     }
 
     fun endScrub() {
+        // Released first and unconditionally: a preview left armed would go on
+        // polling for releases forever, and a note held at the moment the finger
+        // lifted would never be told to stop.
+        if (previewingScrub) {
+            previewingScrub = false
+            engine.endPreview()
+        }
         val target = scrubTick ?: return
         scrubTick = null
         _state.value = _state.value.copy(scrubbing = false)
@@ -367,6 +407,13 @@ class PlayerViewModel(
             engine.resume()
         }
     }
+
+    /** Sounds a key tapped on the drawn keyboard. */
+    fun strikeKey(pitch: Int) {
+        engine.strikeKey(pitch, if (pitch < MIDDLE_C) Hand.LEFT else Hand.RIGHT)
+    }
+
+    fun setVolume(volume: Float) = appSettings.setMasterVolume(volume)
 
     fun setTempoScale(scale: Float) {
         engine.setTempoScale(scale)
@@ -565,6 +612,9 @@ class PlayerViewModel(
         val DRILL_TEMPI = listOf(0.6f, 0.9f, 0.7f, 1.0f, 0.8f, 1.0f)
 
         private const val TAG = "MasterKeyPlayer"
+
+        /** Where a tapped key is assumed to change hands, for colour and channel. */
+        private const val MIDDLE_C = 60
         private const val RANGE_POLL_MS = 300L
 
         fun factory(songId: String) = object : ViewModelProvider.Factory {

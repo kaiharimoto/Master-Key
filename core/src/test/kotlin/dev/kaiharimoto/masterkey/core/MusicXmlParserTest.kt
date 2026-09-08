@@ -324,4 +324,44 @@ class MusicXmlParserTest {
 
         assertThat(doc.tempoBpm).isWithin(0.01).of(76.0)
     }
+    @Test
+    fun `decodes a UTF-16 score rather than producing mojibake`() {
+        // Finale and Sibelius both export UTF-16. Read as UTF-8 it comes out as
+        // rubbish the engraver refuses, with nothing useful to say about why.
+        val xml = """<?xml version="1.0" encoding="UTF-16"?><score-partwise><work>""" +
+            """<work-title>Fur Elise</work-title></work></score-partwise>"""
+        val utf16 = xml.toByteArray(Charsets.UTF_16) // includes a BOM
+
+        val decoded = MusicXmlParser.decodeXml(utf16)
+
+        assertThat(decoded).contains("<work-title>Fur Elise</work-title>")
+        assertThat(decoded.first()).isEqualTo('<')
+    }
+
+    @Test
+    fun `strips the byte order mark from a UTF-8 score`() {
+        val xml = """<?xml version="1.0"?><score-partwise/>"""
+        val withBom = byteArrayOf(0xEF.toByte(), 0xBB.toByte(), 0xBF.toByte()) +
+            xml.toByteArray(Charsets.UTF_8)
+
+        // A U+FEFF ahead of the declaration is rejected by every XML parser.
+        assertThat(MusicXmlParser.decodeXml(withBom)).isEqualTo(xml)
+    }
+
+    @Test
+    fun `unpacks a compressed score whatever it is named`() {
+        val inner = """<?xml version="1.0"?><score-partwise><work>""" +
+            """<work-title>Zipped</work-title></work></score-partwise>"""
+        val zipped = java.io.ByteArrayOutputStream().also { out ->
+            java.util.zip.ZipOutputStream(out).use { zip ->
+                zip.putNextEntry(java.util.zip.ZipEntry("score.xml"))
+                zip.write(inner.toByteArray())
+                zip.closeEntry()
+            }
+        }.toByteArray()
+
+        // Detected by the ZIP header, so a .mxl handed over named .xml still opens.
+        assertThat(MusicXmlParser.decodeXml(zipped)).contains("<work-title>Zipped</work-title>")
+    }
+
 }

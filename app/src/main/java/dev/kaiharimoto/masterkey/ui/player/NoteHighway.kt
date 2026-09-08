@@ -3,7 +3,10 @@ package dev.kaiharimoto.masterkey.ui.player
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
-import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.awaitVerticalTouchSlopOrCancellation
+import androidx.compose.foundation.gestures.verticalDrag
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.mutableLongStateOf
@@ -17,6 +20,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.clipRect
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.TextLayoutResult
 import androidx.compose.ui.text.TextMeasurer
@@ -65,6 +69,9 @@ fun NoteHighway(
     loopEndTick: Long? = null,
     onSeekToTick: ((Long) -> Unit)? = null,
     onKeyTapped: ((Int) -> Unit)? = null,
+    onScrubStart: (() -> Unit)? = null,
+    onScrubTo: ((Long) -> Unit)? = null,
+    onScrubEnd: (() -> Unit)? = null,
 ) {
     val density = LocalDensity.current
     val textMeasurer = rememberTextMeasurer()
@@ -109,25 +116,68 @@ fun NoteHighway(
             .keyboardDepth(minKeyboardPx, minOf(maxKeyboardPx, containerHeight * KEYBOARD_MAX_SHARE))
 
     Canvas(
-        modifier = modifier.pointerInput(model, onSeekToTick, onKeyTapped) {
-            detectTapGestures { offset ->
+        // `settings` is a key because the handler reads lookAheadBeats: without
+        // it the gesture keeps whatever look-ahead was in force when the pointer
+        // input was first set up, and every tap and drag is scaled by a stale
+        // number after the slider moves.
+        modifier = modifier.pointerInput(model, range, settings, onSeekToTick, onKeyTapped, onScrubTo) {
+            // One handler for tap and drag, like the scrubber's: the two have to
+            // share a gesture, because a tap is just a drag that never moved.
+            awaitEachGesture {
+                val down = awaitFirstDown(requireUnconsumed = false)
                 val keyboardHeightPx = keyboardDepth(size.width.toFloat(), size.height.toFloat())
                 val keyLineY = size.height - keyboardHeightPx
-                if (offset.y >= keyLineY) {
-                    onKeyTapped ?: return@detectTapGestures
-                    val layout = HighwayLayout(leftWhite.value, visibleWhite.value, size.width.toFloat())
-                    val isBlackRow =
-                        offset.y < keyLineY + keyboardHeightPx * PianoProportions.BLACK_TO_WHITE_LENGTH
-                    layout.pitchAt(offset.x, isBlackRow, range.low, range.high)
-                        ?.let(onKeyTapped)
-                } else {
-                    onSeekToTick ?: return@detectTapGestures
-                    val ticksPerBeat = beatTicks(model)
-                    val lookAhead = settings.lookAheadBeats * ticksPerBeat
-                    val fraction = (keyLineY - offset.y) / keyLineY
-                    val target = positionTicks.longValue + (fraction * lookAhead).toLong()
-                    onSeekToTick(target.coerceAtLeast(0L))
+
+                // The drawn keyboard is a separate control; a touch that starts
+                // there plays a key and never scrubs.
+                if (down.position.y >= keyLineY) {
+                    down.consume()
+                    onKeyTapped?.let { tapped ->
+                        val layout =
+                            HighwayLayout(leftWhite.value, visibleWhite.value, size.width.toFloat())
+                        val isBlackRow = down.position.y <
+                            keyLineY + keyboardHeightPx * PianoProportions.BLACK_TO_WHITE_LENGTH
+                        layout.pitchAt(down.position.x, isBlackRow, range.low, range.high)
+                            ?.let(tapped)
+                    }
+                    return@awaitEachGesture
                 }
+
+                if (keyLineY <= 0f) return@awaitEachGesture
+                val ticksPerBeat = beatTicks(model)
+                val lookAhead = (settings.lookAheadBeats * ticksPerBeat).coerceAtLeast(1f)
+                val pixelsPerTick = keyLineY / lookAhead
+
+                val slop = awaitVerticalTouchSlopOrCancellation(down.id) { change, _ ->
+                    change.consume()
+                }
+
+                if (slop == null) {
+                    // Never moved: the old tap-to-seek, unchanged. Seeking on a
+                    // single event is fine — it is the per-frame case that would
+                    // thrash the engine.
+                    onSeekToTick?.let { seek ->
+                        val fraction = (keyLineY - down.position.y) / keyLineY
+                        val target = positionTicks.longValue + (fraction * lookAhead).toLong()
+                        seek(target.coerceAtLeast(0L))
+                    }
+                    return@awaitEachGesture
+                }
+
+                val scrubTo = onScrubTo ?: return@awaitEachGesture
+                // Held locally as a Float so slow drags accumulate sub-tick
+                // movement instead of rounding it away to nothing.
+                var tick = positionTicks.longValue.toFloat()
+                onScrubStart?.invoke()
+                verticalDrag(slop.id) { change ->
+                    // Notes fall downwards, so dragging the sheet down pulls
+                    // earlier music back into view — the same direction the
+                    // music itself travels, and the opposite sign to the drag.
+                    tick -= change.positionChange().y / pixelsPerTick
+                    scrubTo(tick.toLong().coerceAtLeast(0L))
+                    change.consume()
+                }
+                onScrubEnd?.invoke()
             }
         },
     ) {

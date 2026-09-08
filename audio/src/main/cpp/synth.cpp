@@ -302,11 +302,42 @@ public:
     }
 
 private:
+    /**
+     * Applies the master gain, sliding towards a new setting rather than
+     * jumping to it.
+     *
+     * A volume slider dragged by a finger produces a new target every frame, and
+     * a gain that steps discontinuously between buffers puts a click at every
+     * boundary — the zipper noise you hear on a badly-implemented fader. Ramping
+     * per sample over a few milliseconds removes it. `currentGain_` is touched
+     * only by this callback, so it needs no atomics.
+     */
     void applyMasterGain(float* out, int32_t numFrames) {
-        const float g = masterGain_.load(std::memory_order_relaxed);
-        if (g == 1.0f) return;
+        const float target = masterGain_.load(std::memory_order_relaxed);
+        if (target == currentGain_ && target == 1.0f) return;
+
         const int32_t n = numFrames * kChannels;
-        for (int32_t i = 0; i < n; ++i) out[i] *= g;
+        if (target == currentGain_) {
+            for (int32_t i = 0; i < n; ++i) out[i] *= currentGain_;
+            return;
+        }
+
+        // Cap the per-sample step so any jump takes at least kGainRampFrames to
+        // complete, however far it has to travel.
+        const float maxStep = 1.0f / static_cast<float>(kGainRampFrames);
+        for (int32_t frame = 0; frame < numFrames; ++frame) {
+            const float delta = target - currentGain_;
+            if (delta > maxStep) {
+                currentGain_ += maxStep;
+            } else if (delta < -maxStep) {
+                currentGain_ -= maxStep;
+            } else {
+                currentGain_ = target;
+            }
+            for (int32_t ch = 0; ch < kChannels; ++ch) {
+                out[static_cast<size_t>(frame) * kChannels + ch] *= currentGain_;
+            }
+        }
     }
 
     /**
@@ -383,6 +414,12 @@ private:
     std::atomic<bool> playing_{false};
     std::atomic<uint32_t> generation_{1};
     std::atomic<float> masterGain_{1.0f};
+
+    /** Gain actually in use, chasing masterGain_. Audio callback only. */
+    float currentGain_{1.0f};
+
+    /** Frames a full 0..1 gain change is spread over — about 10 ms at 48 kHz. */
+    static constexpr int kGainRampFrames = 480;
 };
 
 std::unique_ptr<SynthEngine> gEngine;

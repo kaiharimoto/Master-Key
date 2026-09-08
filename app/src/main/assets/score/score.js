@@ -132,6 +132,7 @@
     load: function (xml) {
       if (!toolkit) {
         status('Engraver not ready.');
+        post({ type: 'error', message: 'The engraver was not ready to load a score.' });
         return;
       }
       status('Engraving…');
@@ -482,7 +483,17 @@
   // verovio-toolkit-wasm.js runs its module as soon as the WASM instantiates,
   // which may already have happened by the time this file executes.
   if (typeof verovio === 'undefined' || !verovio.module) {
+    // Has to be posted, not just written into the page. Kotlin covers the
+    // WebView with an *opaque* overlay until the engraver reports a drawn page,
+    // so an in-page message alone is painted over and never seen — the reader
+    // gets a spinner for fifteen seconds and then a timeout blaming a slow
+    // start. Saying which failure it was is the whole difference between a bug
+    // report and a shrug.
     status('Engraver failed to load.');
+    post({
+      type: 'error',
+      message: 'The engraver failed to load. Verovio did not initialise.',
+    });
   } else if (verovio.module.calledRun) {
     window.MasterKeyScore.init();
   } else {

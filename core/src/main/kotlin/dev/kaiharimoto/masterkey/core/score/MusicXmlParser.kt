@@ -7,6 +7,7 @@ import org.xml.sax.helpers.DefaultHandler
 import java.io.ByteArrayInputStream
 import java.io.File
 import java.io.InputStream
+import java.nio.charset.Charset
 import java.util.zip.ZipInputStream
 import javax.xml.parsers.SAXParserFactory
 
@@ -76,13 +77,59 @@ object MusicXmlParser {
         return handler.build()
     }
 
-    /** Pulls the plain MusicXML out of a `.mxl`, for handing to a renderer. */
-    fun extractXml(file: File): String =
-        if (file.extension.equals("mxl", ignoreCase = true)) {
-            String(file.inputStream().use { readZippedScore(it) })
+    /**
+     * Reads a score file as plain MusicXML text, for handing to a renderer.
+     *
+     * Both halves of this are auto-detection rather than trust in the filename.
+     * A compressed score is recognised by its ZIP header, because plenty of them
+     * are handed out named `.xml`; and the text is decoded by what the file
+     * actually declares, because Finale and Sibelius both emit UTF-16 and
+     * reading that as UTF-8 produces mojibake that the engraver rejects with
+     * nothing more useful to say than "this score could not be read".
+     */
+    fun readXml(file: File): String = decodeXml(file.readBytes())
+
+    /** As [readXml], for bytes already in hand. */
+    fun decodeXml(bytes: ByteArray): String {
+        val raw = if (looksLikeZip(bytes)) {
+            readZippedScore(ByteArrayInputStream(bytes))
         } else {
-            file.readText()
+            bytes
         }
+        // The byte-order mark decodes to a real character, and a U+FEFF sitting
+        // in front of the declaration makes every XML parser reject the prolog.
+        return String(raw, charsetOf(raw)).removePrefix("\uFEFF")
+    }
+
+    /**
+     * Works out how a score is encoded: byte-order mark first, then the XML
+     * declaration, then UTF-8 as the standard's own default.
+     */
+    private fun charsetOf(bytes: ByteArray): Charset {
+        fun startsWith(vararg prefix: Int): Boolean =
+            bytes.size >= prefix.size && prefix.withIndex().all { (i, b) -> bytes[i] == b.toByte() }
+
+        when {
+            startsWith(0xEF, 0xBB, 0xBF) -> return Charsets.UTF_8
+            startsWith(0xFE, 0xFF) -> return Charsets.UTF_16BE
+            startsWith(0xFF, 0xFE) -> return Charsets.UTF_16LE
+        }
+
+        // No BOM. A UTF-16 file without one still gives itself away: every other
+        // byte of `<?xml` is zero.
+        if (bytes.size >= 4 && bytes[0] == 0x3C.toByte() && bytes[1] == 0x00.toByte()) {
+            return Charsets.UTF_16LE
+        }
+        if (bytes.size >= 4 && bytes[0] == 0x00.toByte() && bytes[1] == 0x3C.toByte()) {
+            return Charsets.UTF_16BE
+        }
+
+        val head = String(bytes.copyOfRange(0, minOf(bytes.size, 200)), Charsets.ISO_8859_1)
+        val declared = Regex("encoding\\s*=\\s*[\"']([^\"']+)[\"']", RegexOption.IGNORE_CASE)
+            .find(head)?.groupValues?.get(1)
+        return declared?.let { name -> runCatching { Charset.forName(name) }.getOrNull() }
+            ?: Charsets.UTF_8
+    }
 
     /** `.mxl` is a ZIP; `META-INF/container.xml` names the real score inside. */
     private fun parseCompressed(stream: InputStream): ScoreDocument =
@@ -117,6 +164,7 @@ object MusicXmlParser {
 
         private val notes = mutableListOf<ScoreNote>()
         private val measures = mutableListOf<ScoreMeasure>()
+        private val timeSignatures = mutableListOf<ScoreTimeSignature>()
 
         private var divisions = 1
         private var title: String? = null
@@ -124,6 +172,11 @@ object MusicXmlParser {
         private var tempoBpm: Double? = null
         private var hasFingering = false
         private var maxStaff = 1
+        private var fifths: Int? = null
+        private var isMinor = false
+
+        /** `<beats>` arrives before `<beat-type>`; the pair is banked on the second. */
+        private var pendingBeats: Int? = null
 
         private val text = StringBuilder()
         private var capture = false
@@ -168,8 +221,20 @@ object MusicXmlParser {
                 }
 
                 "divisions", "step", "alter", "octave", "duration", "staff", "voice",
-                "fingering", "beats", "beat-type",
+                "fingering", "beats", "beat-type", "fifths", "mode",
                 -> capture = true
+
+                // Every part restarts at bar one. Without this the second part's
+                // measures are appended *after* the first part's instead of
+                // sounding alongside them, which turns a two-part score into the
+                // same music played twice in a row.
+                "part" -> {
+                    measureStart = 0L
+                    cursor = 0L
+                    maxCursorInMeasure = 0L
+                    measureIndex = -1
+                    previousOnset = 0L
+                }
 
                 "measure" -> {
                     measureIndex++
@@ -234,6 +299,25 @@ object MusicXmlParser {
                 }
 
                 "divisions" -> value.toIntOrNull()?.let { if (it > 0) divisions = it }
+                "beats" -> pendingBeats = value.toIntOrNull()
+                "beat-type" -> {
+                    val numerator = pendingBeats
+                    val denominator = value.toIntOrNull()
+                    pendingBeats = null
+                    if (numerator != null && denominator != null && numerator > 0 && denominator > 0) {
+                        // A multi-part score repeats the same <time> in every
+                        // part, so the same change arrives once per part.
+                        val last = timeSignatures.lastOrNull()
+                        val duplicate = timeSignatures.any { it.onset == measureStart } ||
+                            (last != null && last.numerator == numerator && last.denominator == denominator)
+                        if (!duplicate) {
+                            timeSignatures += ScoreTimeSignature(measureStart, numerator, denominator)
+                        }
+                    }
+                }
+
+                "fifths" -> if (fifths == null) fifths = value.toIntOrNull()
+                "mode" -> if (value.equals("minor", ignoreCase = true)) isMinor = true
                 "step" -> step = value
                 "alter" -> alter = value.toDoubleOrNull()?.toInt() ?: 0
                 "octave" -> octave = value.toIntOrNull()
@@ -329,10 +413,15 @@ object MusicXmlParser {
             composer = composer?.takeIf { it.isNotBlank() },
             divisions = divisions,
             notes = notes,
-            measures = measures,
+            // Parts restart at bar one, so a multi-part score describes the same
+            // bars once per part; the first description of each is enough.
+            measures = measures.distinctBy { it.index },
             tempoBpm = tempoBpm,
             hasFingering = hasFingering,
             hasTwoStaves = maxStaff >= 2,
+            timeSignatures = timeSignatures.sortedBy { it.onset },
+            fifths = fifths,
+            isMinor = isMinor,
         )
     }
 }

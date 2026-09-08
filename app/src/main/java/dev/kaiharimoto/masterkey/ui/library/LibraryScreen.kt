@@ -460,7 +460,13 @@ private fun SongCard(
                 Spacer(Modifier.height(3.dp))
                 Text(
                     buildString {
-                        append(if (song.scoreFileName != null) "MIDI + score" else "MIDI only")
+                        append(
+                            when {
+                                song.midiFileName == SongEntity.NO_MIDI -> "Score only"
+                                song.scoreFileName != null -> "MIDI + score"
+                                else -> "MIDI only"
+                            },
+                        )
                         append(" · ")
                         append(formatDuration(song.durationMicros))
                         song.timeSignature?.let { append(" · $it") }

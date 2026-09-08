@@ -34,9 +34,9 @@ enum class ScorePlacement(val label: String) {
  * how you hold it, and whether you want a count-in is about how you like to
  * start. Storing them per song would mean setting them again for every import.
  *
- * SharedPreferences rather than DataStore: two values, read once at startup and
- * written on a tap. DataStore would add a coroutine-scoped async layer and a
- * dependency for no benefit at this size.
+ * SharedPreferences rather than DataStore: a handful of values, read once at
+ * startup and written on a tap. DataStore would add a coroutine-scoped async
+ * layer and a dependency for no benefit at this size.
  */
 class AppSettings(context: Context) {
 
@@ -80,9 +80,28 @@ class AppSettings(context: Context) {
     private val _keyboardWhiteKeys = MutableStateFlow(prefs.getInt(KEY_KEYBOARD_KEYS, KEYBOARD_AUTO))
     val keyboardWhiteKeys: StateFlow<Int> = _keyboardWhiteKeys.asStateFlow()
 
+    /**
+     * Output level, 0..1, applied as a gain on the whole mix.
+     *
+     * Not quite the same thing as the tablet's own volume: this one sets how
+     * loud the app is *against the piano you are sitting at*, which is a
+     * property of the room and stays put, while the system volume is the one
+     * you grab when someone walks in. Defaults below full so there is headroom
+     * to turn it up without reaching for the hardware keys.
+     */
+    private val _masterVolume = MutableStateFlow(prefs.getFloat(KEY_VOLUME, DEFAULT_VOLUME))
+    val masterVolume: StateFlow<Float> = _masterVolume.asStateFlow()
+
     /** Whether the falling-note highway is shown at all. */
     private val _showHighway = MutableStateFlow(prefs.getBoolean(KEY_SHOW_HIGHWAY, true))
     val showHighway: StateFlow<Boolean> = _showHighway.asStateFlow()
+
+    fun setMasterVolume(volume: Float) {
+        val clamped = volume.coerceIn(0f, 1f)
+        if (_masterVolume.value == clamped) return
+        _masterVolume.value = clamped
+        prefs.edit().putFloat(KEY_VOLUME, clamped).apply()
+    }
 
     fun setScorePlacement(placement: ScorePlacement) {
         if (_scorePlacement.value == placement) return
@@ -124,6 +143,9 @@ class AppSettings(context: Context) {
         const val MIN_WHITE_KEYS = 12
         const val MAX_WHITE_KEYS = 52
 
+        /** Loud enough to practise to, with room to go up. */
+        const val DEFAULT_VOLUME = 0.8f
+
         const val MIN_SCORE_ZOOM = 45
         const val MAX_SCORE_ZOOM = 130
         const val DEFAULT_SCORE_ZOOM = 70
@@ -133,5 +155,6 @@ class AppSettings(context: Context) {
         private const val KEY_SCORE_ZOOM = "scoreZoom"
         private const val KEY_KEYBOARD_KEYS = "keyboardWhiteKeys"
         private const val KEY_SHOW_HIGHWAY = "showHighway"
+        private const val KEY_VOLUME = "masterVolume"
     }
 }

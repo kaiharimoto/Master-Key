@@ -12,6 +12,7 @@ import dev.kaiharimoto.masterkey.core.midi.MidiLoader
 import dev.kaiharimoto.masterkey.core.midi.MidiParseException
 import dev.kaiharimoto.masterkey.core.model.Piece
 import dev.kaiharimoto.masterkey.core.score.MusicXmlParser
+import dev.kaiharimoto.masterkey.core.score.toPiece
 import dev.kaiharimoto.masterkey.core.score.ScoreDocument
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
@@ -81,14 +82,10 @@ class SongRepository(
         val midis = named.filter { isMidi(it.second) }
         val scores = named.filter { isScore(it.second) }
 
-        if (midis.isEmpty()) {
+        if (midis.isEmpty() && scores.isEmpty()) {
             return@withContext ImportResult.Failure(
-                if (scores.isEmpty()) {
-                    "Pick a MIDI file (.mid). You can select its MusicXML score at the " +
-                        "same time and they'll be paired automatically."
-                } else {
-                    "That's a score with no MIDI. Select the .mid file too."
-                },
+                "Pick a MIDI file (.mid) or a MusicXML score (.musicxml, .mxl). " +
+                    "Select both at once and they'll be paired automatically.",
             )
         }
 
@@ -115,6 +112,21 @@ class SongRepository(
             )
         }
 
+        // Whatever is left is a score that paired with nothing. It used to be
+        // dropped in silence, which is the worst of both worlds: the import
+        // reported success and the sheet music pane then had nothing to show and
+        // no reason to give. A MusicXML says everything a MIDI does about which
+        // notes sound when, so it becomes a song in its own right.
+        for ((scoreUri, scoreName) in unusedScores) {
+            val result = runCatching { importScoreOnly(scoreUri, scoreName) }
+            result.getOrNull()?.let { song ->
+                imported += song
+                paired++
+            } ?: return@withContext ImportResult.Failure(
+                result.exceptionOrNull()?.message ?: "Couldn't import $scoreName.",
+            )
+        }
+
         ImportResult.Success(imported, paired)
     }
 
@@ -137,11 +149,24 @@ class SongRepository(
         songDao.delete(song)
     }
 
-    /** Parses the stored MIDI into a playable piece. */
+    /**
+     * Parses the song into a playable piece.
+     *
+     * Usually that means the MIDI. A song imported from a MusicXML alone has no
+     * MIDI to parse, and its notation is the score of record, so the piece is
+     * derived from the same file the engraver is given.
+     */
     suspend fun loadPiece(song: SongEntity): Result<Piece> = withContext(Dispatchers.IO) {
         runCatching {
-            val file = File(File(libraryRoot, song.folder), song.midiFileName)
-            MidiLoader.load(file.readBytes())
+            val folder = File(libraryRoot, song.folder)
+            val midi = File(folder, song.midiFileName)
+            if (song.midiFileName != SongEntity.NO_MIDI && midi.exists()) {
+                MidiLoader.load(midi.readBytes())
+            } else {
+                val name = song.scoreFileName
+                    ?: throw IllegalStateException("This song has no MIDI and no sheet music.")
+                MusicXmlParser.parse(File(folder, name).readBytes()).toPiece()
+            }
         }
     }
 
@@ -176,18 +201,89 @@ class SongRepository(
             return@withContext Result.failure(IllegalStateException("$name is missing from the library."))
         }
 
-        runCatching {
-            if (name.endsWith(".mxl", ignoreCase = true)) {
-                MusicXmlParser.extractXml(file)
-            } else {
-                file.readText()
-            }
-        }.onFailure { Log.w(TAG, "couldn't read $name", it) }
+        // Detected from the bytes, not the extension: a compressed score named
+        // .xml still opens, and a UTF-16 export decodes as text rather than as
+        // mojibake the engraver silently refuses.
+        runCatching { MusicXmlParser.readXml(file) }
+            .onFailure { Log.w(TAG, "couldn't read $name", it) }
     }
 
     fun scoreFile(song: SongEntity): File? {
         val name = song.scoreFileName ?: return null
         return File(File(libraryRoot, song.folder), name).takeIf { it.exists() }
+    }
+
+    /**
+     * Imports a MusicXML with no MIDI beside it.
+     *
+     * The score is both halves at once: it is engraved as notation *and* parsed
+     * into the piece that gets played, so the two can never disagree about the
+     * music. It also carries the hand split and the fingering explicitly, which
+     * the MIDI path has to guess at.
+     */
+    private suspend fun importScoreOnly(scoreUri: Uri, scoreName: String): SongEntity {
+        val id = UUID.randomUUID().toString()
+        val folder = File(libraryRoot, id).apply { mkdirs() }
+
+        val scoreTarget = File(folder, "score.${extension(scoreName)}")
+        if (!copy(scoreUri, scoreTarget)) {
+            folder.deleteRecursively()
+            throw IllegalStateException("Couldn't read $scoreName.")
+        }
+
+        val document = try {
+            MusicXmlParser.parse(scoreTarget.readBytes())
+        } catch (e: Exception) {
+            folder.deleteRecursively()
+            throw IllegalStateException(describeScoreProblem(scoreName, scoreTarget, e))
+        }
+
+        val piece = document.toPiece()
+        if (piece.notes.isEmpty()) {
+            folder.deleteRecursively()
+            throw IllegalStateException("$scoreName has no notes in it.")
+        }
+
+        val range = piece.pitchRange
+        val song = SongEntity(
+            id = id,
+            title = document.title?.takeIf { it.isNotBlank() } ?: prettyTitle(scoreName),
+            composer = document.composer,
+            folder = id,
+            midiFileName = SongEntity.NO_MIDI,
+            scoreFileName = scoreTarget.name,
+            durationMicros = piece.durationMicros,
+            barCount = countBars(piece),
+            noteCount = piece.notes.size,
+            pitchLow = range?.first ?: 21,
+            pitchHigh = range?.last ?: 108,
+            keySignature = piece.keySignatureAt(0)?.displayName,
+            timeSignature = piece.timeSignatureAt(0).toString(),
+            originalBpm = piece.tempoMap.bpmAt(0),
+        )
+        songDao.upsert(song)
+        LibraryScanner.write(folder, song.toManifest(originalScoreName = scoreName))
+        return song
+    }
+
+    /**
+     * Says what is actually wrong with a score, rather than "couldn't be read".
+     *
+     * `score-timewise` is the case worth naming: it is valid MusicXML, both our
+     * parser and Verovio only handle `score-partwise`, and the two look
+     * identical to anyone who has not read the spec.
+     */
+    private fun describeScoreProblem(name: String, file: File, error: Throwable): String {
+        val head = runCatching {
+            MusicXmlParser.readXml(file).take(2000)
+        }.getOrDefault("")
+        return when {
+            head.contains("score-timewise") ->
+                "$name is a timewise MusicXML, which this app can't read. " +
+                    "Most notation apps can export the partwise form instead."
+
+            else -> "$name couldn't be read.\n${error.message ?: error::class.simpleName.orEmpty()}"
+        }
     }
 
     private suspend fun importOne(
@@ -258,9 +354,18 @@ class SongRepository(
 
         for (found in LibraryScanner.scan(libraryRoot)) {
             if (found.folder.name in known) continue
-            val midi = found.midiFile ?: continue
 
-            val piece = runCatching { MidiLoader.load(midi.readBytes()) }.getOrNull() ?: continue
+            // Same two sources as an import, and in the same order: the MIDI
+            // when there is one, otherwise the score, which carries the notes
+            // too. A folder with neither is not reported by the scanner.
+            val midi = found.midiFile
+            val score = found.scoreFile
+            val piece = when {
+                midi != null -> runCatching { MidiLoader.load(midi.readBytes()) }.getOrNull()
+                score != null ->
+                    runCatching { MusicXmlParser.parse(score.readBytes()).toPiece() }.getOrNull()
+                else -> null
+            } ?: continue
             val manifest = found.manifest
             val range = piece.pitchRange
             val settings = manifest?.settings ?: SongSettingsManifest()
@@ -270,12 +375,15 @@ class SongRepository(
                     id = manifest?.id ?: found.folder.name,
                     title = manifest?.title
                         ?: LibraryScanner.titleFromFileName(
-                            manifest?.originalMidiName ?: midi.name,
+                            manifest?.originalMidiName
+                                ?: manifest?.originalScoreName
+                                ?: midi?.name
+                                ?: score?.name.orEmpty(),
                         ),
                     composer = manifest?.composer,
                     folder = found.folder.name,
-                    midiFileName = midi.name,
-                    scoreFileName = found.scoreFile?.name,
+                    midiFileName = midi?.name ?: SongEntity.NO_MIDI,
+                    scoreFileName = score?.name,
                     durationMicros = piece.durationMicros,
                     barCount = countBars(piece),
                     noteCount = piece.notes.size,
