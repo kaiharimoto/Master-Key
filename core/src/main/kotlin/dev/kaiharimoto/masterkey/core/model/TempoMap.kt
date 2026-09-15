@@ -24,6 +24,17 @@ class TempoMap private constructor(
 
     val tempoChanges: List<TempoChange> get() = changes
 
+    /**
+     * Ticks per second for an SMPTE-division file, or null for the usual
+     * ticks-per-quarter kind.
+     *
+     * Exposed so a writer can tell the two apart: an SMPTE piece's ticks mean
+     * absolute time rather than musical time, and [ticksPerQuarter] is a stand-in
+     * 1 rather than a real resolution, so it cannot be re-encoded as a normal
+     * division without changing what every tick means.
+     */
+    val smpteTicksPerSecond: Double? get() = ticksPerSecond
+
     fun tickToMicros(tick: Long): Long {
         ticksPerSecond?.let { return ((tick / it) * 1_000_000.0).toLong() }
         val change = changeAtTick(tick)

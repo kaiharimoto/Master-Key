@@ -105,6 +105,18 @@ val SHORTCUT_GROUPS: List<Pair<String, List<Shortcut>>> = listOf(
         Shortcut("M", "Metronome"),
         Shortcut("N", "Count-in"),
     ),
+    // Only live while edit mode is on, where the arrows belong to the selected
+    // note rather than to the transport.
+    "Editing" to listOf(
+        Shortcut("E", "Enter / leave edit mode"),
+        Shortcut("↑ ↓", "Move the note a semitone"),
+        Shortcut("⇧ ↑ ↓", "Move it an octave"),
+        Shortcut("← →", "Move it one grid step earlier / later"),
+        Shortcut("⇧ ← →", "Make it one step shorter / longer"),
+        Shortcut("Del", "Delete the selected note"),
+        Shortcut("Z", "Undo"),
+        Shortcut("⇧ Z", "Redo"),
+    ),
     "View" to listOf(
         Shortcut("S", "Show / hide sheet music"),
         Shortcut("H", "Show / hide falling notes"),

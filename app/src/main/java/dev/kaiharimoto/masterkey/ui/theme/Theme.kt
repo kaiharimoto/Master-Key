@@ -39,6 +39,20 @@ object HighwayColors {
     val keyBlack = Color(0xFF1B1F27)
     val keyLabel = Color(0xFF7A8496)
     val middleCMarker = Color(0xFFE0574B)
+
+    // ---- edit mode ----
+    //
+    // Deliberately a colour used nowhere else. Hand colours mean "which hand"
+    // everywhere in this app, so borrowing one for "selected" would make the
+    // selection read as a change of hand — which is a thing edit mode cannot
+    // even do.
+    val editSelection = Color(0xFFE8ECF5)
+    val editBorder = Color(0xFF5B6478)
+    val editGhost = Color(0x88E8ECF5)
+
+    /** Where a note being dragged used to be, so the move reads as a move. */
+    val editGhostOrigin = Color(0x2EE8ECF5)
+    val editSnapLine = Color(0xFF1A1F29)
 }
 
 private val DarkScheme = darkColorScheme(

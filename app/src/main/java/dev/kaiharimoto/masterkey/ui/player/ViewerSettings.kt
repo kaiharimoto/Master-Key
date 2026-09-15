@@ -176,17 +176,29 @@ fun ViewerSettingsSheet(
                 checked = state.countInEnabled,
                 onChange = { viewModel.toggleCountIn() },
             )
+            // Goes lower than it used to: editing wants to zoom right in, and a
+            // pinch on the highway lands on this same value, so the slider has to
+            // be able to express what the pinch produces or the two would
+            // disagree about where the music is.
             SettingSlider(
                 label = "Look ahead",
                 value = state.settings.lookAheadBeats,
-                range = 3f..16f,
-                steps = 12,
-                readout = "${state.settings.lookAheadBeats.roundToInt()} beats",
+                range = 1f..16f,
+                steps = 29,
+                readout = beatsReadout(state.settings.lookAheadBeats),
                 onChange = viewModel::setLookAheadBeats,
             )
         }
     }
 }
+
+/** Whole beats read as whole numbers; a half beat needs its half shown. */
+private fun beatsReadout(beats: Float): String =
+    if (beats == beats.roundToInt().toFloat()) {
+        "${beats.roundToInt()} beats"
+    } else {
+        String.format("%.1f beats", beats)
+    }
 
 @Composable
 private fun Heading(text: String) {

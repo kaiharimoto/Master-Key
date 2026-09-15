@@ -10,6 +10,7 @@ import dev.kaiharimoto.masterkey.core.library.SongManifest
 import dev.kaiharimoto.masterkey.core.library.SongSettingsManifest
 import dev.kaiharimoto.masterkey.core.midi.MidiLoader
 import dev.kaiharimoto.masterkey.core.midi.MidiParseException
+import dev.kaiharimoto.masterkey.core.midi.MidiWriter
 import dev.kaiharimoto.masterkey.core.model.Piece
 import dev.kaiharimoto.masterkey.core.score.MusicXmlParser
 import dev.kaiharimoto.masterkey.core.score.toPiece
@@ -57,7 +58,20 @@ class SongRepository(
      */
     suspend fun update(song: SongEntity) = withContext(Dispatchers.IO) {
         songDao.update(song)
-        LibraryScanner.write(folderFor(song), song.toManifest())
+        val folder = folderFor(song)
+        // The original filenames are only known at import time, and
+        // `toManifest()` defaults them to null — so rewriting the manifest from
+        // a row alone used to erase them on every settings change, quietly
+        // undoing the one thing that lets a recovered library re-derive a title.
+        // Carrying them forward from whatever is already on disk costs one read.
+        val existing = LibraryScanner.read(folder)
+        LibraryScanner.write(
+            folder,
+            song.toManifest(
+                originalMidiName = existing?.originalMidiName,
+                originalScoreName = existing?.originalScoreName,
+            ),
+        )
     }
 
     suspend fun touch(id: String) = songDao.touch(id)
@@ -211,6 +225,121 @@ class SongRepository(
     fun scoreFile(song: SongEntity): File? {
         val name = song.scoreFileName ?: return null
         return File(File(libraryRoot, song.folder), name).takeIf { it.exists() }
+    }
+
+    // ---- editing the notes ----------------------------------------------------
+    //
+    // Saving an edit rewrites the song's MIDI. That is a deliberate choice: it
+    // keeps one source of truth, so the highway, playback and the
+    // rebuild-from-disk recovery path can never disagree about what the notes
+    // are. The cost is that a rewritten file carries only what Master Key
+    // parses — notes, tempo, metre, key — and loses sustain pedal, other
+    // instruments and every kind of text the original may have had.
+    //
+    // So the imported file is stashed before the first write and never deleted.
+    // It goes in a *subdirectory* rather than beside the song, because
+    // `LibraryScanner.scan` resolves a folder's MIDI by manifest name and falls
+    // back to "the first file with a MIDI extension" — a sibling backup would be
+    // a live candidate for that fallback, with directory listing order deciding
+    // which file a recovered library played. A subdirectory is invisible to the
+    // scanner, which only considers plain files, and `delete()` already removes
+    // the folder recursively.
+
+    /** True when this song still has the file it was imported from. */
+    fun hasImportedBackup(song: SongEntity): Boolean = importedBackup(song)?.exists() == true
+
+    /**
+     * Writes [piece] over the song's MIDI, backing up the import the first time.
+     *
+     * Returns the song with its cached analysis refreshed — note count, duration,
+     * bar count and pitch range all change with the notes, and they are what the
+     * library list and the initial key range are drawn from.
+     */
+    suspend fun saveEditedPiece(
+        song: SongEntity,
+        piece: Piece,
+    ): Result<SongEntity> = withContext(Dispatchers.IO) {
+        runCatching {
+            val folder = folderFor(song).apply { mkdirs() }
+            val targetName = song.midiFileName.takeIf { it != SongEntity.NO_MIDI }
+                ?: EDITED_MIDI_NAME
+            val target = File(folder, targetName)
+
+            // Encode before touching anything on disk, so a piece the writer
+            // refuses leaves the library exactly as it was.
+            val bytes = MidiWriter.write(piece)
+
+            if (target.exists() && !hasImportedBackup(song)) {
+                val backupDir = File(folder, ORIGINAL_DIR).apply { mkdirs() }
+                target.copyTo(File(backupDir, targetName), overwrite = true)
+            }
+
+            // Write beside, then rename. A crash mid-write must not leave half a
+            // MIDI where the song used to be; a rename within one directory is
+            // atomic, a partial overwrite is not.
+            val temp = File(folder, "$targetName.writing")
+            temp.writeBytes(bytes)
+            if (!temp.renameTo(target)) {
+                temp.delete()
+                throw IllegalStateException("Couldn't replace ${target.name}.")
+            }
+
+            val updated = song.copy(midiFileName = targetName).withAnalysisOf(piece)
+            update(updated)
+            updated
+        }.onFailure { Log.w(TAG, "couldn't save edits for ${song.title}", it) }
+    }
+
+    /**
+     * Puts the imported file back.
+     *
+     * The backup is kept rather than consumed, so reverting twice is harmless and
+     * a song can be edited again afterwards.
+     */
+    suspend fun revertToImported(song: SongEntity): Result<SongEntity> = withContext(Dispatchers.IO) {
+        runCatching {
+            val folder = folderFor(song)
+            val backup = importedBackup(song)
+
+            if (backup == null || !backup.exists()) {
+                // No backup means the song never had a MIDI: it was imported from
+                // a MusicXML alone and saving created one. Reverting is deleting
+                // that file and letting `loadPiece` fall back to the score again.
+                val created = File(folder, song.midiFileName)
+                if (song.midiFileName == SongEntity.NO_MIDI || song.scoreFileName == null) {
+                    throw IllegalStateException("There's no imported version of this song to go back to.")
+                }
+                created.delete()
+                val piece = MusicXmlParser.parse(File(folder, song.scoreFileName).readBytes()).toPiece()
+                val restored = song.copy(midiFileName = SongEntity.NO_MIDI).withAnalysisOf(piece)
+                update(restored)
+                return@runCatching restored
+            }
+
+            backup.copyTo(File(folder, backup.name), overwrite = true)
+            val piece = MidiLoader.load(File(folder, backup.name).readBytes())
+            val restored = song.copy(midiFileName = backup.name).withAnalysisOf(piece)
+            update(restored)
+            restored
+        }.onFailure { Log.w(TAG, "couldn't revert ${song.title}", it) }
+    }
+
+    private fun importedBackup(song: SongEntity): File? {
+        val dir = File(folderFor(song), ORIGINAL_DIR)
+        if (!dir.isDirectory) return null
+        return dir.listFiles()?.firstOrNull { it.isFile }
+    }
+
+    /** Refreshes the cached fields that change when the notes do. */
+    private fun SongEntity.withAnalysisOf(piece: Piece): SongEntity {
+        val range = piece.pitchRange
+        return copy(
+            durationMicros = piece.durationMicros,
+            barCount = countBars(piece),
+            noteCount = piece.notes.size,
+            pitchLow = range?.first ?: 21,
+            pitchHigh = range?.last ?: 108,
+        )
     }
 
     /**
@@ -452,6 +581,12 @@ class SongRepository(
 
     private companion object {
         const val TAG = "MasterKeyLibrary"
+
+        /** Subdirectory holding the file a song was imported from. */
+        const val ORIGINAL_DIR = "original"
+
+        /** Filename for the MIDI created when a score-only song is first edited. */
+        const val EDITED_MIDI_NAME = "source.mid"
     }
 
     /**

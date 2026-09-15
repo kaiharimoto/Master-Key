@@ -132,6 +132,54 @@ class PlaybackEngine(private val context: Context) {
         seekInternal(0L)
     }
 
+    /**
+     * Swaps in an edited piece without moving the playhead.
+     *
+     * [load] is for opening a song, and rewinds to the top — which is exactly
+     * wrong for an edit, where the whole point is to hear the change in the
+     * passage you are already looking at.
+     *
+     * The mechanism is the loop wrap's, not the seek's. `synth.flush()` bumps
+     * the native event generation, so the up-to-[LOOKAHEAD_MS] of note-ons and
+     * note-offs already queued for the *old* notes are discarded rather than
+     * firing against the new ones — but unlike a seek it does not move the audio
+     * clock, so the stream is never restarted and the playhead does not jump.
+     * Whatever was sounding is cut and re-struck, which is one soft
+     * re-articulation, the same as every loop wrap already does.
+     */
+    suspend fun updatePiece(updated: Piece) = withContext(engineDispatcher) {
+        val wasPlaying = _state.value.isPlaying
+        val tick = currentTick().coerceIn(0L, updated.endTick.coerceAtLeast(0L))
+
+        piece = updated
+        maxNoteDurationTicks = updated.notes.maxOfOrNull { it.durationTicks } ?: 0L
+
+        // A loop drawn round bars that an edit has just shortened past would keep
+        // wrapping to a point the piece no longer reaches.
+        _state.value.loop?.let { loop ->
+            if (loop.endTick > updated.endTick || loop.startTick >= updated.endTick) {
+                _state.value = _state.value.copy(loop = null)
+            }
+        }
+
+        if (wasPlaying && synth.isCreated && updated.notes.isNotEmpty()) {
+            val frame = synth.transportFrames()
+            synth.flush()
+            anchorTick = tick
+            anchorFrame = frame
+            // No count-in on an edit, for the same reason a loop wrap has none.
+            countInUntilFrame = frame
+            resetCursors(tick)
+            scheduleNotesAlreadySounding(tick)
+            _state.value = _state.value.copy(positionTick = tick)
+            // The scheduler job is left running; the next pump refills the
+            // horizon from the new notes within one interval.
+        } else {
+            _state.value = _state.value.copy(positionTick = tick)
+            seekInternal(tick)
+        }
+    }
+
     fun play() {
         scope.launch {
             if (!synth.isCreated || piece.notes.isEmpty()) return@launch

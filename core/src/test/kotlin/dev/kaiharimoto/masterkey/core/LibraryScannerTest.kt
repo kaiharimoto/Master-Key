@@ -150,6 +150,36 @@ class LibraryScannerTest {
     }
 
     @Test
+    fun `an edited song's backup subfolder is not mistaken for the song`() {
+        // Saving an edit stashes the imported file under `original/`. It has to
+        // be a subdirectory rather than a sibling: the resolver falls back to
+        // "the first file with a MIDI extension", so a backup sitting beside the
+        // song would be a live candidate for it, and directory listing order
+        // would decide which of the two a recovered library played.
+        val folder = songFolder("edited", midi = "source.mid")
+        File(folder, "original").mkdirs()
+        File(folder, "original/source.mid").writeBytes(byteArrayOf(9, 9, 9))
+
+        val found = LibraryScanner.scan(temp.root)
+
+        assertThat(found).hasSize(1)
+        assertThat(found.single().midiFile?.name).isEqualTo("source.mid")
+        assertThat(found.single().midiFile?.parentFile?.name).isEqualTo("edited")
+    }
+
+    @Test
+    fun `the backup subfolder is invisible even with no manifest to go by`() {
+        val folder = songFolder("edited", midi = "source.mid", manifest = null)
+        File(folder, "original").mkdirs()
+        File(folder, "original/source.mid").writeBytes(byteArrayOf(9, 9, 9))
+
+        val found = LibraryScanner.scan(temp.root)
+
+        assertThat(found).hasSize(1)
+        assertThat(found.single().midiFile?.parentFile?.name).isEqualTo("edited")
+    }
+
+    @Test
     fun `titles are derived from filenames`() {
         assertThat(LibraryScanner.titleFromFileName("Fur_Elise-Beethoven.mid"))
             .isEqualTo("Fur Elise Beethoven")

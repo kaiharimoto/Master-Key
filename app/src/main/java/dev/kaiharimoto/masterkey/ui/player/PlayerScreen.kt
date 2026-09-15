@@ -23,6 +23,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.MusicNote
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
@@ -32,6 +33,8 @@ import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.filled.Timer
 import androidx.compose.material.icons.filled.Visibility
+import androidx.activity.compose.BackHandler
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -43,6 +46,7 @@ import androidx.compose.material3.IconButtonDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
@@ -148,8 +152,40 @@ private fun handleShortcut(
         }
     }
 
+    // Edit mode claims the keys that would otherwise seek and change tempo:
+    // while you are placing notes, the arrows belong to the note in hand.
+    // Everything not listed falls through to the transport below, so space
+    // still plays and the hand toggles still work.
+    if (state.editing) {
+        when (event.keyCode) {
+            android.view.KeyEvent.KEYCODE_DPAD_UP -> {
+                viewModel.nudgePitch(if (shifted) 12 else 1); return true
+            }
+            android.view.KeyEvent.KEYCODE_DPAD_DOWN -> {
+                viewModel.nudgePitch(if (shifted) -12 else -1); return true
+            }
+            android.view.KeyEvent.KEYCODE_DPAD_LEFT -> {
+                if (shifted) viewModel.nudgeLength(-1) else viewModel.nudgeStart(-1); return true
+            }
+            android.view.KeyEvent.KEYCODE_DPAD_RIGHT -> {
+                if (shifted) viewModel.nudgeLength(1) else viewModel.nudgeStart(1); return true
+            }
+            android.view.KeyEvent.KEYCODE_DEL,
+            android.view.KeyEvent.KEYCODE_FORWARD_DEL,
+            -> return once(viewModel::deleteSelected)
+            android.view.KeyEvent.KEYCODE_Z ->
+                return once { if (shifted) viewModel.redo() else viewModel.undo() }
+            android.view.KeyEvent.KEYCODE_Y -> return once(viewModel::redo)
+            android.view.KeyEvent.KEYCODE_E,
+            android.view.KeyEvent.KEYCODE_ESCAPE,
+            -> return once(viewModel::requestLeaveEdit)
+            else -> Unit
+        }
+    }
+
     return when (event.keyCode) {
         android.view.KeyEvent.KEYCODE_SPACE -> once(viewModel::togglePlay)
+        android.view.KeyEvent.KEYCODE_E -> once(viewModel::toggleEditMode)
         android.view.KeyEvent.KEYCODE_DPAD_LEFT -> {
             viewModel.seekByBars(if (shifted) -4 else -1); true
         }
@@ -268,6 +304,11 @@ private fun PlayerContent(
             }
         }
     }
+    // Written by the highway's gesture handler at pointer rate and read only in
+    // its draw phase. Remembered out here rather than inside NoteHighway so it
+    // survives the movableContent relocation along with the pane itself.
+    val editState = remember { HighwayEditState() }
+
     val highway = remember {
         movableContentOf { paneModifier: Modifier ->
             NoteHighway(
@@ -283,9 +324,26 @@ private fun PlayerContent(
                 // rather than to seekTo is what keeps it live and cheap: the
                 // playhead is overridden for the UI while the engine is left
                 // alone until the finger lifts.
-                onScrubStart = viewModel::beginScrubWithPreview,
+                //
+                // While editing the preview is off: hearing every note you drag
+                // past is what makes scrubbing usable for finding a passage, and
+                // exactly what makes it intolerable while placing notes.
+                onScrubStart = {
+                    if (latest.editing) viewModel.beginScrub() else viewModel.beginScrubWithPreview()
+                },
                 onScrubTo = viewModel::updateScrub,
                 onScrubEnd = viewModel::endScrub,
+                editing = latest.editing,
+                edit = editState,
+                snapGrid = latest.snapGrid,
+                selectedIndex = latest.selectedIndex,
+                snapAnchorAt = viewModel::snapAnchor,
+                onSelect = viewModel::select,
+                onDraftAt = viewModel::noteDraftAt,
+                onNewNoteDraft = viewModel::draftForNewNote,
+                onCommitDrag = viewModel::commitDrag,
+                onInsertNote = viewModel::insertNote,
+                onLookAheadCommitted = viewModel::setLookAheadBeats,
                 modifier = paneModifier,
             )
         }
@@ -333,11 +391,27 @@ private fun PlayerContent(
             }
         }
 
+        if (state.editing) EditBar(state, viewModel)
+
         TransportBar(state, viewModel, model)
     }
 
     if (state.showViewerSettings) {
         ViewerSettingsSheet(state, viewModel, onDismiss = viewModel::hideViewerSettings)
+    }
+
+    // Backing out with unsaved edits asks first. Process death cannot, so the
+    // dialog says the file is the thing that lasts rather than pretending
+    // otherwise.
+    BackHandler(enabled = state.editing) { viewModel.requestLeaveEdit() }
+
+    if (!state.editing && state.editBlocked != null) {
+        AlertDialog(
+            onDismissRequest = viewModel::dismissEditBlocked,
+            title = { Text("Can't edit this song") },
+            text = { Text(state.editBlocked) },
+            confirmButton = { TextButton(onClick = viewModel::dismissEditBlocked) { Text("OK") } },
+        )
     }
 }
 
@@ -398,6 +472,14 @@ private fun TopBar(state: PlayerUiState, viewModel: PlayerViewModel, onBack: () 
                 "Bar ${state.currentBar} of ${state.model?.barCount ?: 1}",
                 style = MaterialTheme.typography.labelSmall,
                 color = Color(0xFF7A8496),
+            )
+        }
+
+        IconButton(onClick = viewModel::toggleEditMode) {
+            Icon(
+                Icons.Default.Edit,
+                contentDescription = if (state.editing) "Leave edit mode" else "Edit the notes",
+                tint = if (state.editing) HandColors.amber else Color(0xFF7A8496),
             )
         }
 

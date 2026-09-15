@@ -5,12 +5,16 @@ import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
-import androidx.compose.foundation.gestures.awaitVerticalTouchSlopOrCancellation
+import androidx.compose.foundation.gestures.calculatePan
+import androidx.compose.foundation.gestures.calculateZoom
+import androidx.compose.foundation.gestures.drag
 import androidx.compose.foundation.gestures.verticalDrag
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.CornerRadius
@@ -18,7 +22,12 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.DrawScope
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.clipRect
+import androidx.compose.ui.input.pointer.AwaitPointerEventScope
+import androidx.compose.ui.input.pointer.PointerId
+import androidx.compose.ui.input.pointer.PointerInputChange
+import androidx.compose.ui.input.pointer.changedToUpIgnoreConsumed
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.ui.platform.LocalDensity
@@ -30,6 +39,8 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import dev.kaiharimoto.masterkey.core.edit.NoteDraft
+import dev.kaiharimoto.masterkey.core.edit.SnapGrid
 import dev.kaiharimoto.masterkey.core.keyboard.KeyRange
 import dev.kaiharimoto.masterkey.core.keyboard.PianoProportions
 import dev.kaiharimoto.masterkey.core.midi.Pitch
@@ -38,6 +49,7 @@ import dev.kaiharimoto.masterkey.core.model.Note
 import dev.kaiharimoto.masterkey.ui.theme.HighwayColors
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
+import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
 
@@ -72,6 +84,18 @@ fun NoteHighway(
     onScrubStart: (() -> Unit)? = null,
     onScrubTo: ((Long) -> Unit)? = null,
     onScrubEnd: (() -> Unit)? = null,
+    // ---- edit mode ----
+    editing: Boolean = false,
+    edit: HighwayEditState? = null,
+    snapGrid: SnapGrid = SnapGrid.DEFAULT,
+    selectedIndex: Int = HighwayHitTest.NONE,
+    snapAnchorAt: ((Long) -> Long)? = null,
+    onSelect: ((Int) -> Unit)? = null,
+    onDraftAt: ((Int) -> NoteDraft?)? = null,
+    onNewNoteDraft: ((pitch: Int, startTick: Long, lengthTicks: Long) -> NoteDraft?)? = null,
+    onCommitDrag: ((index: Int, draft: NoteDraft, minLengthTicks: Long) -> Unit)? = null,
+    onInsertNote: ((draft: NoteDraft, minLengthTicks: Long) -> Unit)? = null,
+    onLookAheadCommitted: ((Float) -> Unit)? = null,
 ) {
     val density = LocalDensity.current
     val textMeasurer = rememberTextMeasurer()
@@ -84,6 +108,20 @@ fun NoteHighway(
             withFrameNanos { positionTicks.longValue = positionProvider() }
         }
     }
+
+    // Read inside the gesture coroutine, which must survive them changing.
+    //
+    // These used to be `pointerInput` keys. That fixed a real bug — a handler
+    // that captured `lookAheadBeats` once went on scaling every tap by a stale
+    // number after the slider moved — but it is the costlier of the two fixes,
+    // and pinch-to-zoom makes it untenable: zooming writes look-ahead, which
+    // would re-key the handler, which cancels the coroutine, which ends the
+    // pinch after a single frame. Reading through `rememberUpdatedState` cannot
+    // go stale *and* cannot cancel anything.
+    val latestSettings by rememberUpdatedState(settings)
+    val latestRange by rememberUpdatedState(range)
+    val latestSelected by rememberUpdatedState(selectedIndex)
+    val latestGrid by rememberUpdatedState(snapGrid)
 
     // Animating the visible span as two floats is what allows a smooth pan
     // between key ranges rather than a jump from one keyboard layout to another.
@@ -115,21 +153,22 @@ fun NoteHighway(
         HighwayLayout(leftWhite.value, visibleWhite.value, containerWidth)
             .keyboardDepth(minKeyboardPx, minOf(maxKeyboardPx, containerHeight * KEYBOARD_MAX_SHARE))
 
+    val handlePx = with(density) { GRIP_DEPTH.toPx() }
+    val minTouchPx = with(density) { MIN_TOUCH_TARGET.toPx() }
+
     Canvas(
-        // `settings` is a key because the handler reads lookAheadBeats: without
-        // it the gesture keeps whatever look-ahead was in force when the pointer
-        // input was first set up, and every tap and drag is scaled by a stale
-        // number after the slider moves.
-        modifier = modifier.pointerInput(model, range, settings, onSeekToTick, onKeyTapped, onScrubTo) {
-            // One handler for tap and drag, like the scrubber's: the two have to
-            // share a gesture, because a tap is just a drag that never moved.
+        modifier = modifier.pointerInput(model, editing, onSeekToTick, onKeyTapped, onScrubTo) {
+            // One handler for every interaction the pane has, because they all
+            // begin the same way — a finger going down — and only diverge once
+            // it has moved, or not, or been joined by a second one.
             awaitEachGesture {
                 val down = awaitFirstDown(requireUnconsumed = false)
                 val keyboardHeightPx = keyboardDepth(size.width.toFloat(), size.height.toFloat())
                 val keyLineY = size.height - keyboardHeightPx
 
                 // The drawn keyboard is a separate control; a touch that starts
-                // there plays a key and never scrubs.
+                // there plays a key and never scrubs. Unchanged in edit mode —
+                // hearing a pitch while placing notes is exactly what you want.
                 if (down.position.y >= keyLineY) {
                     down.consume()
                     onKeyTapped?.let { tapped ->
@@ -137,47 +176,129 @@ fun NoteHighway(
                             HighwayLayout(leftWhite.value, visibleWhite.value, size.width.toFloat())
                         val isBlackRow = down.position.y <
                             keyLineY + keyboardHeightPx * PianoProportions.BLACK_TO_WHITE_LENGTH
-                        layout.pitchAt(down.position.x, isBlackRow, range.low, range.high)
+                        layout.pitchAt(down.position.x, isBlackRow, latestRange.low, latestRange.high)
                             ?.let(tapped)
                     }
                     return@awaitEachGesture
                 }
 
                 if (keyLineY <= 0f) return@awaitEachGesture
+
+                val layout = HighwayLayout(leftWhite.value, visibleWhite.value, size.width.toFloat())
                 val ticksPerBeat = beatTicks(model)
-                val lookAhead = (settings.lookAheadBeats * ticksPerBeat).coerceAtLeast(1f)
+                val lookAhead = (effectiveLookAheadBeats(latestSettings, edit) * ticksPerBeat)
+                    .coerceAtLeast(1f)
                 val pixelsPerTick = keyLineY / lookAhead
 
-                val slop = awaitVerticalTouchSlopOrCancellation(down.id) { change, _ ->
-                    change.consume()
+                val hitIndex = if (editing) {
+                    HighwayHitTest.noteAt(
+                        model = model,
+                        layout = layout,
+                        x = down.position.x,
+                        y = down.position.y,
+                        playheadTick = positionTicks.longValue,
+                        keyLineY = keyLineY,
+                        pixelsPerTick = pixelsPerTick,
+                        minTouchPx = minTouchPx,
+                        preferIndex = latestSelected,
+                    )
+                } else {
+                    HighwayHitTest.NONE
                 }
 
-                if (slop == null) {
-                    // Never moved: the old tap-to-seek, unchanged. Seeking on a
-                    // single event is fine — it is the per-frame case that would
-                    // thrash the engine.
-                    onSeekToTick?.let { seek ->
-                        val fraction = (keyLineY - down.position.y) / keyLineY
-                        val target = positionTicks.longValue + (fraction * lookAhead).toLong()
-                        seek(target.coerceAtLeast(0L))
+                // Resolving what the gesture *is* has to be a hand-rolled loop.
+                // The stock helpers each wait for exactly one outcome and give no
+                // chance to bail out; here a second finger, the touch slop and the
+                // long-press clock are all in the running at once.
+                val intent = awaitIntent(
+                    down = down,
+                    editing = editing,
+                    overANote = hitIndex != HighwayHitTest.NONE,
+                )
+
+                when (intent) {
+                    Intent.TRANSFORM -> runTransform(
+                        pixelsPerTick = pixelsPerTick,
+                        startTick = positionTicks.longValue,
+                        edit = edit,
+                        settings = latestSettings,
+                        onScrubStart = onScrubStart,
+                        onScrubTo = onScrubTo,
+                        onScrubEnd = onScrubEnd,
+                        onLookAheadCommitted = onLookAheadCommitted,
+                    )
+
+                    Intent.TAP -> if (editing) {
+                        // Tap-to-seek is off while editing: it is the gesture
+                        // that collides hardest with tapping a note, and the
+                        // scrubber and two-finger pan both still move the
+                        // playhead.
+                        onSelect?.invoke(hitIndex)
+                    } else {
+                        onSeekToTick?.let { seek ->
+                            val fraction = (keyLineY - down.position.y) / keyLineY
+                            val target = positionTicks.longValue + (fraction * lookAhead).toLong()
+                            seek(target.coerceAtLeast(0L))
+                        }
                     }
-                    return@awaitEachGesture
-                }
 
-                val scrubTo = onScrubTo ?: return@awaitEachGesture
-                // Held locally as a Float so slow drags accumulate sub-tick
-                // movement instead of rounding it away to nothing.
-                var tick = positionTicks.longValue.toFloat()
-                onScrubStart?.invoke()
-                verticalDrag(slop.id) { change ->
-                    // Notes fall downwards, so dragging the sheet down pulls
-                    // earlier music back into view — the same direction the
-                    // music itself travels, and the opposite sign to the drag.
-                    tick -= change.positionChange().y / pixelsPerTick
-                    scrubTo(tick.toLong().coerceAtLeast(0L))
-                    change.consume()
+                    Intent.EDIT_DRAG -> runNoteDrag(
+                        pointerId = down.id,
+                        index = hitIndex,
+                        down = down.position,
+                        layout = layout,
+                        range = latestRange,
+                        grid = latestGrid,
+                        ticksPerQuarter = model.piece.tempoMap.ticksPerQuarter,
+                        snapAnchorAt = snapAnchorAt,
+                        playheadTick = positionTicks.longValue,
+                        keyLineY = keyLineY,
+                        pixelsPerTick = pixelsPerTick,
+                        handlePx = handlePx,
+                        edit = edit,
+                        onSelect = onSelect,
+                        onDraftAt = onDraftAt,
+                        onCommitDrag = onCommitDrag,
+                        onKeyTapped = onKeyTapped,
+                    )
+
+                    Intent.CREATE -> runNoteDraw(
+                        pointerId = down.id,
+                        down = down.position,
+                        layout = layout,
+                        range = latestRange,
+                        grid = latestGrid,
+                        ticksPerQuarter = model.piece.tempoMap.ticksPerQuarter,
+                        snapAnchorAt = snapAnchorAt,
+                        playheadTick = positionTicks.longValue,
+                        keyLineY = keyLineY,
+                        pixelsPerTick = pixelsPerTick,
+                        edit = edit,
+                        onNewNoteDraft = onNewNoteDraft,
+                        onInsertNote = onInsertNote,
+                        onKeyTapped = onKeyTapped,
+                    )
+
+                    Intent.SCRUB -> {
+                        val scrubTo = onScrubTo ?: return@awaitEachGesture
+                        // Held locally as a Float so slow drags accumulate
+                        // sub-tick movement instead of rounding it away.
+                        var tick = positionTicks.longValue.toFloat()
+                        onScrubStart?.invoke()
+                        verticalDrag(down.id) { change ->
+                            // Notes fall downwards, so dragging the sheet down
+                            // pulls earlier music back into view — the same
+                            // direction the music travels, and the opposite sign
+                            // to the drag.
+                            tick -= change.positionChange().y / pixelsPerTick
+                            scrubTo(tick.toLong().coerceAtLeast(0L))
+                            change.consume()
+                        }
+                        onScrubEnd?.invoke()
+                    }
+
+                    Intent.NONE -> Unit
                 }
-                onScrubEnd?.invoke()
             }
         },
     ) {
@@ -191,8 +312,25 @@ fun NoteHighway(
 
         val layout = HighwayLayout(leftWhite.value, visibleWhite.value, width)
         val ticksPerBeat = beatTicks(model)
-        val lookAheadTicks = (settings.lookAheadBeats * ticksPerBeat).coerceAtLeast(1f)
+        // Reading the pinch here, in the draw phase, is what makes zooming
+        // smooth without recomposing: the gesture writes one float and only the
+        // drawing is invalidated.
+        val lookAheadTicks = (effectiveLookAheadBeats(settings, edit) * ticksPerBeat)
+            .coerceAtLeast(1f)
         val pixelsPerTick = keyLineY / lookAheadTicks
+
+        // Read once per frame, like the playhead above it, and never in the
+        // composable body — that is the whole reason this state exists.
+        val dragIndex = edit?.dragIndex?.intValue ?: HighwayEditState.NO_DRAG
+        val ghost = if (editing && edit != null && edit.ghosting) {
+            GhostNote(
+                pitch = edit.ghostPitch.intValue,
+                startTick = edit.ghostStart.longValue,
+                endTick = edit.ghostEnd.longValue,
+            )
+        } else {
+            null
+        }
 
         drawRect(HighwayColors.background)
 
@@ -200,6 +338,20 @@ fun NoteHighway(
 
         if (settings.showBeatGrid) {
             drawGrid(model, position, lookAheadTicks, pixelsPerTick, keyLineY, width, labelCache)
+        }
+
+        // The subdivisions the snap grid will round to, so you can see where a
+        // note is about to land rather than discovering it afterwards.
+        if (editing) {
+            drawSnapLines(
+                model = model,
+                grid = snapGrid,
+                position = position,
+                lookAheadTicks = lookAheadTicks.toLong(),
+                pixelsPerTick = pixelsPerTick,
+                keyLineY = keyLineY,
+                width = width,
+            )
         }
 
         drawLoopBracket(loopStartTick, loopEndTick, position, pixelsPerTick, keyLineY, width)
@@ -217,7 +369,22 @@ fun NoteHighway(
                 cornerPx = cornerPx,
                 labelCache = labelCache,
                 soundingOut = sounding,
+                editing = editing,
+                selectedIndex = selectedIndex,
+                dragIndex = dragIndex,
+                handlePx = handlePx,
             )
+
+            ghost?.let {
+                drawGhost(
+                    ghost = it,
+                    position = position,
+                    pixelsPerTick = pixelsPerTick,
+                    keyLineY = keyLineY,
+                    layout = layout,
+                    cornerPx = cornerPx,
+                )
+            }
         }
 
         // Hit line: where a note must be played. Drawn after notes so it reads as
@@ -237,7 +404,288 @@ fun NoteHighway(
             settings = settings,
             labelCache = labelCache,
         )
+
+        // An unmistakable border, because the one thing worse than not being in
+        // edit mode is being in it without realising.
+        if (editing) {
+            drawRect(
+                color = HighwayColors.editBorder,
+                topLeft = Offset(0f, 0f),
+                size = Size(width, height),
+                style = Stroke(width = EDIT_BORDER_PX),
+            )
+        }
     }
+}
+
+/** A note as the finger currently has it, before the edit is committed. */
+private class GhostNote(val pitch: Int, val startTick: Long, val endTick: Long)
+
+/** What a gesture on the highway turned out to be. */
+private enum class Intent {
+    /** Never moved far enough to be a drag. */
+    TAP,
+
+    /** One finger, dragging the music past the key line. */
+    SCRUB,
+
+    /** One finger, dragging a note it landed on. */
+    EDIT_DRAG,
+
+    /** Held still on empty space long enough to mean "put a note here". */
+    CREATE,
+
+    /** A second finger arrived: pinch to zoom, drag to scroll. */
+    TRANSFORM,
+
+    /** Nothing to do. */
+    NONE,
+}
+
+/**
+ * Works out what the gesture is.
+ *
+ * Four things are racing: the finger moving past the touch slop, a second finger
+ * arriving, the long-press clock running out, and the finger lifting. Compose's
+ * stock helpers each wait for one of those and swallow the rest, so this watches
+ * all four itself. The slop test is the standard one — accumulated distance
+ * against `viewConfiguration.touchSlop` — so a drag starts feeling exactly as it
+ * did before edit mode existed.
+ */
+private suspend fun AwaitPointerEventScope.awaitIntent(
+    down: PointerInputChange,
+    editing: Boolean,
+    overANote: Boolean,
+): Intent {
+    var travelled = Offset.Zero
+    val longPressAt = System.nanoTime() + LONG_PRESS_NANOS
+
+    while (true) {
+        val event = awaitPointerEvent()
+        val pressed = event.changes.filter { it.pressed }
+
+        // A second finger always wins, in both modes: today it is simply
+        // ignored, so nothing can regress by claiming it.
+        if (pressed.size >= 2) return Intent.TRANSFORM
+
+        val change = pressed.firstOrNull { it.id == down.id } ?: return Intent.TAP
+        if (change.changedToUpIgnoreConsumed()) return Intent.TAP
+
+        travelled += change.positionChange()
+        // Dragging a note moves it sideways as well as along, so that one needs
+        // two-dimensional slop. Everything else scrolls the music, which is a
+        // vertical gesture — and measuring it vertically is what stops a
+        // sideways swipe from being read as a scrub, exactly as before.
+        val slopped = if (editing && overANote) {
+            travelled.getDistance() > viewConfiguration.touchSlop
+        } else {
+            abs(travelled.y) > viewConfiguration.touchSlop
+        }
+        if (slopped) {
+            return when {
+                !editing -> Intent.SCRUB
+                overANote -> Intent.EDIT_DRAG
+                // An empty-lane drag still scrolls while editing. It is the only
+                // one-finger way through the piece now that tap-to-seek is gone,
+                // and the alternative — a drag that does nothing — is worse.
+                else -> Intent.SCRUB
+            }
+        }
+
+        if (editing && !overANote && System.nanoTime() >= longPressAt) return Intent.CREATE
+
+        change.consume()
+    }
+}
+
+/**
+ * Two fingers: pinch to zoom the timeline, drag to scroll it.
+ *
+ * Zoom *divides* the look-ahead — pinching apart should show less music more
+ * closely, which is fewer beats, not more. The result is kept local and
+ * committed once on release, because `setLookAheadBeats` writes the database and
+ * the on-disk manifest; committing per frame would be a few hundred file writes
+ * for one pinch. The tempo slider does the same thing for the same reason.
+ */
+private suspend fun AwaitPointerEventScope.runTransform(
+    pixelsPerTick: Float,
+    startTick: Long,
+    edit: HighwayEditState?,
+    settings: ScaffoldSettings,
+    onScrubStart: (() -> Unit)?,
+    onScrubTo: ((Long) -> Unit)?,
+    onScrubEnd: (() -> Unit)?,
+    onLookAheadCommitted: ((Float) -> Unit)?,
+) {
+    // Navigation, not listening: a two-finger scroll should not sound the notes
+    // it passes the way a one-finger scrub does.
+    onScrubStart?.invoke()
+    var tick = startTick.toFloat()
+    var zoomed = false
+
+    do {
+        val event = awaitPointerEvent()
+        val zoom = event.calculateZoom()
+        if (zoom != 1f && zoom > 0f && edit != null) {
+            val next = (edit.zoom.floatValue / zoom)
+            val beats = (settings.lookAheadBeats * next)
+                .coerceIn(MIN_LOOK_AHEAD_BEATS, MAX_LOOK_AHEAD_BEATS)
+            edit.zoom.floatValue = beats / settings.lookAheadBeats
+            zoomed = true
+        }
+
+        val pan = event.calculatePan()
+        if (pan.y != 0f && pixelsPerTick > 0f) {
+            tick -= pan.y / pixelsPerTick
+            onScrubTo?.invoke(tick.toLong().coerceAtLeast(0L))
+        }
+
+        event.changes.forEach { it.consume() }
+    } while (event.changes.any { it.pressed })
+
+    onScrubEnd?.invoke()
+
+    if (zoomed && edit != null) {
+        val committed = (settings.lookAheadBeats * edit.zoom.floatValue)
+            .coerceIn(MIN_LOOK_AHEAD_BEATS, MAX_LOOK_AHEAD_BEATS)
+        edit.zoom.floatValue = 1f
+        // Rounded to a half beat so the number the pinch produced and the number
+        // the look-ahead slider shows are the same one.
+        onLookAheadCommitted?.invoke(Math.round(committed * 2f) / 2f)
+    }
+}
+
+/** Dragging an existing note: move it, or take one of its ends. */
+private suspend fun AwaitPointerEventScope.runNoteDrag(
+    pointerId: PointerId,
+    index: Int,
+    down: Offset,
+    layout: HighwayLayout,
+    range: KeyRange,
+    grid: SnapGrid,
+    ticksPerQuarter: Int,
+    snapAnchorAt: ((Long) -> Long)?,
+    playheadTick: Long,
+    keyLineY: Float,
+    pixelsPerTick: Float,
+    handlePx: Float,
+    edit: HighwayEditState?,
+    onSelect: ((Int) -> Unit)?,
+    onDraftAt: ((Int) -> NoteDraft?)?,
+    onCommitDrag: ((Int, NoteDraft, Long) -> Unit)?,
+    onKeyTapped: ((Int) -> Unit)?,
+) {
+    val original = onDraftAt?.invoke(index) ?: return
+    onSelect?.invoke(index)
+
+    val bottomY = HighwayHitTest.yAt(original.startTick, playheadTick, keyLineY, pixelsPerTick)
+    val topY = HighwayHitTest.yAt(original.endTick, playheadTick, keyLineY, pixelsPerTick)
+    val zone = HighwayHitTest.zoneAt(down.y, topY, bottomY, handlePx)
+    val minLength = NoteDrag.minLengthTicks(grid, ticksPerQuarter)
+    val anchor = snapAnchorAt?.invoke(original.startTick) ?: 0L
+
+    var current = original
+    var lastPitch = original.pitch
+    var travelled = Offset.Zero
+
+    drag(pointerId) { change ->
+        travelled += change.positionChange()
+        // Ticks increase upwards, pixels downwards.
+        val deltaTicks = (-travelled.y / pixelsPerTick).toLong()
+        val pitch = if (zone == DragZone.BODY) {
+            HighwayHitTest.laneAt(layout, down.x + travelled.x, range.low, range.high)
+                ?: current.pitch
+        } else {
+            original.pitch
+        }
+
+        current = NoteDrag.apply(
+            original = original,
+            zone = zone,
+            deltaTicks = deltaTicks,
+            pitch = pitch,
+            grid = grid,
+            ticksPerQuarter = ticksPerQuarter,
+            anchor = anchor,
+        )
+        edit?.showGhost(index, current)
+
+        // Sound the note each time it crosses into a new lane, so moving one is
+        // audible rather than purely visual. Bounded by pitch changes, not by
+        // frames, so a slow drag does not machine-gun.
+        if (current.pitch != lastPitch) {
+            lastPitch = current.pitch
+            onKeyTapped?.invoke(current.pitch)
+        }
+        change.consume()
+    }
+
+    edit?.clearGhost()
+    if (current != original) onCommitDrag?.invoke(index, current, minLength)
+}
+
+/** Long-pressed on empty space: draw a new note, dragging upwards to lengthen it. */
+private suspend fun AwaitPointerEventScope.runNoteDraw(
+    pointerId: PointerId,
+    down: Offset,
+    layout: HighwayLayout,
+    range: KeyRange,
+    grid: SnapGrid,
+    ticksPerQuarter: Int,
+    snapAnchorAt: ((Long) -> Long)?,
+    playheadTick: Long,
+    keyLineY: Float,
+    pixelsPerTick: Float,
+    edit: HighwayEditState?,
+    onNewNoteDraft: ((Int, Long, Long) -> NoteDraft?)?,
+    onInsertNote: ((NoteDraft, Long) -> Unit)?,
+    onKeyTapped: ((Int) -> Unit)?,
+) {
+    val pitch = HighwayHitTest.laneAt(layout, down.x, range.low, range.high) ?: return
+    val startTick = HighwayHitTest.tickAt(down.y, playheadTick, keyLineY, pixelsPerTick)
+    val anchor = snapAnchorAt?.invoke(startTick) ?: 0L
+    val length = NoteDrag.newNoteLength(grid, ticksPerQuarter)
+
+    val seed = onNewNoteDraft?.invoke(pitch, startTick, length) ?: return
+    var current = NoteDrag.drawn(
+        pitch = pitch,
+        startTick = startTick,
+        toTick = startTick + length,
+        velocity = seed.velocity,
+        hand = seed.hand,
+        grid = grid,
+        ticksPerQuarter = ticksPerQuarter,
+        anchor = anchor,
+    )
+    edit?.showGhost(HighwayEditState.NO_DRAG, current)
+    onKeyTapped?.invoke(pitch)
+
+    var travelled = Offset.Zero
+    drag(pointerId) { change ->
+        travelled += change.positionChange()
+        val toTick = startTick + (-travelled.y / pixelsPerTick).toLong() + length
+        current = NoteDrag.drawn(
+            pitch = pitch,
+            startTick = startTick,
+            toTick = toTick,
+            velocity = seed.velocity,
+            hand = seed.hand,
+            grid = grid,
+            ticksPerQuarter = ticksPerQuarter,
+            anchor = anchor,
+        )
+        edit?.showGhost(HighwayEditState.NO_DRAG, current)
+        change.consume()
+    }
+
+    edit?.clearGhost()
+    onInsertNote?.invoke(current, NoteDrag.minLengthTicks(grid, ticksPerQuarter))
+}
+
+/** Look-ahead with any live pinch folded in, in beats. */
+private fun effectiveLookAheadBeats(settings: ScaffoldSettings, edit: HighwayEditState?): Float {
+    val zoom = edit?.zoom?.floatValue ?: 1f
+    return (settings.lookAheadBeats * zoom).coerceIn(MIN_LOOK_AHEAD_BEATS, MAX_LOOK_AHEAD_BEATS)
 }
 
 private fun beatTicks(model: HighwayModel): Float {
@@ -330,6 +778,10 @@ private fun DrawScope.drawNotes(
     cornerPx: Float,
     labelCache: TextLayoutCache,
     soundingOut: MutableList<Note>,
+    editing: Boolean = false,
+    selectedIndex: Int = HighwayHitTest.NONE,
+    dragIndex: Int = HighwayEditState.NO_DRAG,
+    handlePx: Float = 0f,
 ) {
     val horizon = position + lookAheadTicks
     val notes = model.notes
@@ -338,6 +790,7 @@ private fun DrawScope.drawNotes(
     while (index < notes.size) {
         val note = notes[index]
         if (note.startTick > horizon) break
+        val here = index
         index++
 
         if (note.endTick <= position) continue
@@ -354,6 +807,20 @@ private fun DrawScope.drawNotes(
 
         val left = layout.leftOf(note.pitch)
         val noteWidth = layout.widthOf(note.pitch)
+
+        // The note being dragged is drawn faintly where it *was*, so the ghost
+        // reads as a move rather than as a second note appearing.
+        val beingDragged = editing && here == dragIndex
+        if (beingDragged) {
+            drawRoundRect(
+                color = HighwayColors.editGhostOrigin,
+                topLeft = Offset(left, top),
+                size = Size(noteWidth, noteHeight),
+                cornerRadius = CornerRadius(cornerPx),
+            )
+            continue
+        }
+
         val color = NoteColors.forNote(note.pitch, note.hand, settings.colorMode, isSounding)
 
         // A sounding note gets a soft halo so the eye is drawn to what is
@@ -385,6 +852,10 @@ private fun DrawScope.drawNotes(
             )
         }
 
+        if (editing && here == selectedIndex) {
+            drawSelection(left, top, noteWidth, noteHeight, cornerPx, handlePx)
+        }
+
         drawNoteAnnotations(
             note = note,
             left = left,
@@ -394,6 +865,109 @@ private fun DrawScope.drawNotes(
             settings = settings,
             labelCache = labelCache,
         )
+    }
+}
+
+/**
+ * The selected note's outline and its two grips.
+ *
+ * The grips are only drawn when the note is tall enough for them to be aimable —
+ * the same threshold [HighwayHitTest.zoneAt] uses to decide whether they exist
+ * at all, so what is drawn and what responds to a finger cannot disagree.
+ */
+private fun DrawScope.drawSelection(
+    left: Float,
+    top: Float,
+    noteWidth: Float,
+    noteHeight: Float,
+    cornerPx: Float,
+    handlePx: Float,
+) {
+    drawRoundRect(
+        color = HighwayColors.editSelection,
+        topLeft = Offset(left - 1.5f, top - 1.5f),
+        size = Size(noteWidth + 3f, noteHeight + 3f),
+        cornerRadius = CornerRadius(cornerPx + 1.5f),
+        style = Stroke(width = SELECTION_STROKE_PX),
+    )
+
+    if (!HighwayHitTest.hasGrips(top, top + noteHeight, handlePx)) return
+    val grip = handlePx.coerceAtMost(noteHeight / 3f)
+    val inset = noteWidth * 0.25f
+    for (y in listOf(top + grip / 2f, top + noteHeight - grip / 2f)) {
+        drawRoundRect(
+            color = HighwayColors.editSelection,
+            topLeft = Offset(left + inset, y - GRIP_BAR_PX / 2f),
+            size = Size(noteWidth - inset * 2f, GRIP_BAR_PX),
+            cornerRadius = CornerRadius(GRIP_BAR_PX / 2f),
+        )
+    }
+}
+
+/** The note as the finger currently has it, drawn over everything else. */
+private fun DrawScope.drawGhost(
+    ghost: GhostNote,
+    position: Long,
+    pixelsPerTick: Float,
+    keyLineY: Float,
+    layout: HighwayLayout,
+    cornerPx: Float,
+) {
+    if (!layout.isVisible(ghost.pitch)) return
+    val bottom = keyLineY - (ghost.startTick - position) * pixelsPerTick
+    val top = keyLineY - (ghost.endTick - position) * pixelsPerTick
+    val height = bottom - top
+    if (height <= 0f) return
+
+    val left = layout.leftOf(ghost.pitch)
+    val width = layout.widthOf(ghost.pitch)
+
+    drawRoundRect(
+        color = HighwayColors.editGhost,
+        topLeft = Offset(left, top),
+        size = Size(width, height),
+        cornerRadius = CornerRadius(cornerPx),
+    )
+    drawRoundRect(
+        color = HighwayColors.editSelection,
+        topLeft = Offset(left, top),
+        size = Size(width, height),
+        cornerRadius = CornerRadius(cornerPx),
+        style = Stroke(width = SELECTION_STROKE_PX),
+    )
+}
+
+/**
+ * The subdivisions a note will snap to.
+ *
+ * Drawn only between the beat lines the grid already draws, and skipped
+ * entirely when the steps would be closer together than a couple of pixels —
+ * a solid grey wash is not a grid, it is just a darker background.
+ */
+private fun DrawScope.drawSnapLines(
+    model: HighwayModel,
+    grid: SnapGrid,
+    position: Long,
+    lookAheadTicks: Long,
+    pixelsPerTick: Float,
+    keyLineY: Float,
+    width: Float,
+) {
+    if (grid.isFree) return
+    val ppq = model.piece.tempoMap.ticksPerQuarter
+    val unit = grid.unitTicks(ppq)
+    if (unit <= 0L) return
+    if (unit * pixelsPerTick < MIN_SNAP_LINE_GAP_PX) return
+
+    val horizon = position + lookAheadTicks
+    var tick = (position / unit) * unit
+    if (tick < position) tick += unit
+    var drawn = 0
+    while (tick <= horizon && drawn < MAX_SNAP_LINES) {
+        val y = keyLineY - (tick - position) * pixelsPerTick
+        drawRect(HighwayColors.editSnapLine, Offset(0f, y), Size(width, 1f))
+        tick += unit
+        drawn++
     }
 }
 
@@ -528,6 +1102,38 @@ private class TextLayoutCache(private val measurer: TextMeasurer) {
 private val KEYBOARD_MIN_DEPTH = 78.dp
 private val KEYBOARD_MAX_DEPTH = 168.dp
 private const val KEYBOARD_MAX_SHARE = 0.34f
+
+/**
+ * How deep a note's start and end grips are.
+ *
+ * Roughly a fingertip. A note shorter than three of these has no grips at all —
+ * see [HighwayHitTest.zoneAt]; a four-pixel grip is not a control, it is a coin
+ * toss between moving the note and resizing it.
+ */
+private val GRIP_DEPTH = 20.dp
+
+/** Smallest a note may be drawn and still be reliably hittable. */
+private val MIN_TOUCH_TARGET = 24.dp
+
+/**
+ * How far the pinch may take the look-ahead.
+ *
+ * One beat over the height of the pane makes a 1/32 note about eighty pixels
+ * tall, which is as fine as this editor ever needs to be aimed.
+ */
+private const val MIN_LOOK_AHEAD_BEATS = 1f
+private const val MAX_LOOK_AHEAD_BEATS = 16f
+
+/** Long enough not to fire on a slow tap, short enough not to feel stuck. */
+private const val LONG_PRESS_NANOS = 400_000_000L
+
+private const val SELECTION_STROKE_PX = 2.5f
+private const val GRIP_BAR_PX = 3f
+private const val EDIT_BORDER_PX = 3f
+
+/** Below this, subdivision lines stop being a grid and become a grey wash. */
+private const val MIN_SNAP_LINE_GAP_PX = 6f
+private const val MAX_SNAP_LINES = 400
 
 private val NOTE_LABEL_DARK = TextStyle(
     color = Color(0xFF14161C),

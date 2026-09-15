@@ -12,7 +12,13 @@ import dev.kaiharimoto.masterkey.audio.LoopRegion
 import dev.kaiharimoto.masterkey.audio.PlaybackEngine
 import dev.kaiharimoto.masterkey.core.keyboard.KeyRange
 import dev.kaiharimoto.masterkey.core.keyboard.KeyRangeSelector
+import dev.kaiharimoto.masterkey.core.edit.EditCommand
+import dev.kaiharimoto.masterkey.core.edit.EditSession
+import dev.kaiharimoto.masterkey.core.edit.NoteDraft
+import dev.kaiharimoto.masterkey.core.edit.NoteId
+import dev.kaiharimoto.masterkey.core.edit.SnapGrid
 import dev.kaiharimoto.masterkey.core.keyboard.RangeSection
+import dev.kaiharimoto.masterkey.core.midi.MidiWriter
 import dev.kaiharimoto.masterkey.core.model.Hand
 import dev.kaiharimoto.masterkey.core.model.Note
 import dev.kaiharimoto.masterkey.core.model.Piece
@@ -67,6 +73,25 @@ data class PlayerUiState(
     /** True while the scrubber is being dragged. */
     val scrubbing: Boolean = false,
     val showShortcuts: Boolean = false,
+
+    // ---- edit mode ----
+    val editing: Boolean = false,
+    /** Why this song cannot be edited, when it cannot. */
+    val editBlocked: String? = null,
+    val snapGrid: SnapGrid = SnapGrid.DEFAULT,
+    /** Index into `model.notes` of the selected note, or -1. */
+    val selectedIndex: Int = -1,
+    val selectedNote: Note? = null,
+    val canUndo: Boolean = false,
+    val canRedo: Boolean = false,
+    /** True when there are edits that have not been written to the file. */
+    val editDirty: Boolean = false,
+    val hasImportedBackup: Boolean = false,
+    /** Set when a save or revert failed, for the toolbar to show. */
+    val editError: String? = null,
+    /** Shown after a successful save, so a silent write is still visible. */
+    val editSaved: Boolean = false,
+    val confirmLeavingEdit: Boolean = false,
 )
 
 class PlayerViewModel(
@@ -195,7 +220,11 @@ class PlayerViewModel(
         viewModelScope.launch {
             while (true) {
                 val sections = _state.value.sections
-                if (sections.size > 1) {
+                // Frozen while editing. The highway animates a range change by
+                // sliding the keyboard sideways over 550 ms; if that happens
+                // mid-drag the lanes move out from under the finger and the note
+                // lands on a pitch nobody aimed at.
+                if (sections.size > 1 && !_state.value.editing) {
                     val section = sections.rangeAt(positionTicks(), baseRange)
                     val target = rangeFor(section, _state.value.keyboardWhiteKeys)
                     if (target != _state.value.range) {
@@ -579,6 +608,322 @@ class PlayerViewModel(
 
     fun stopTempoDrill() {
         _state.value = _state.value.copy(drillStep = null)
+    }
+
+    // ---- edit mode ------------------------------------------------------------
+
+    /**
+     * The editing session, alive only while edit mode is on.
+     *
+     * Deliberately not in [PlayerUiState]: nothing composes the undo stack, and
+     * putting a mutable object in an immutable state class invites someone to
+     * assume a copy is a snapshot. Only its derived booleans go into the state.
+     */
+    private var session: EditSession? = null
+
+    private var selectedId: NoteId? = null
+
+    fun toggleEditMode() {
+        if (_state.value.editing) requestLeaveEdit() else enterEditMode()
+    }
+
+    private fun enterEditMode() {
+        val song = _state.value.song ?: return
+        // Refuse before the work rather than after it: a piece whose ticks are
+        // absolute time cannot be written back as a normal MIDI division, so
+        // letting someone edit it would mean failing at the save.
+        if (!MidiWriter.canWrite(piece)) {
+            _state.value = _state.value.copy(
+                editBlocked = "This song uses SMPTE timing, which Master Key can't write back yet.",
+            )
+            return
+        }
+
+        // Editing notes as they stream past is not editing, it is whack-a-mole.
+        engine.pause()
+
+        val started = EditSession(piece)
+        session = started
+        // The session sorts by (start, pitch); the MusicXML path sorts by start
+        // alone, so a score-only song can come in with a chord's notes in a
+        // different order. Adopting the session's ordering up front is what keeps
+        // "the note at index 7" the same note on both sides — otherwise tapping
+        // one note of a chord would select another.
+        piece = started.toPiece()
+        viewModelScope.launch { engine.updatePiece(piece) }
+
+        selectedId = null
+        _state.value = _state.value.copy(
+            editing = true,
+            model = HighwayModel(piece),
+            editBlocked = null,
+            editError = null,
+            editSaved = false,
+            selectedIndex = -1,
+            selectedNote = null,
+            canUndo = false,
+            canRedo = false,
+            editDirty = false,
+            hasImportedBackup = repository.hasImportedBackup(song),
+        )
+    }
+
+    fun dismissEditBlocked() {
+        if (_state.value.editBlocked != null) {
+            _state.value = _state.value.copy(editBlocked = null)
+        }
+    }
+
+    /** Leaves edit mode, asking first when there is unsaved work. */
+    fun requestLeaveEdit() {
+        if (_state.value.editDirty) {
+            _state.value = _state.value.copy(confirmLeavingEdit = true)
+        } else {
+            leaveEditMode()
+        }
+    }
+
+    fun cancelLeavingEdit() {
+        _state.value = _state.value.copy(confirmLeavingEdit = false)
+    }
+
+    private fun leaveEditMode() {
+        session = null
+        selectedId = null
+        _state.value = _state.value.copy(
+            editing = false,
+            confirmLeavingEdit = false,
+            selectedIndex = -1,
+            selectedNote = null,
+            canUndo = false,
+            canRedo = false,
+            editDirty = false,
+        )
+    }
+
+    fun setSnapGrid(grid: SnapGrid) {
+        _state.value = _state.value.copy(snapGrid = grid)
+    }
+
+    /** Where the grid starts at [tick], which a change of metre moves. */
+    fun snapAnchor(tick: Long): Long = SnapGrid.anchorFor(piece, tick)
+
+    val ticksPerQuarter: Int get() = piece.tempoMap.ticksPerQuarter
+
+    fun select(index: Int) {
+        val current = session ?: return
+        val id = if (index >= 0) current.notes.idAt(index) else null
+        selectedId = id
+        val note = id?.let { current[it] }
+        _state.value = _state.value.copy(
+            selectedIndex = if (note == null) -1 else index,
+            selectedNote = note,
+        )
+        note?.let { engine.strikeKey(it.pitch, it.hand) }
+    }
+
+    /** A new note takes the loudness and the hand the rest of the piece implies. */
+    fun draftForNewNote(pitch: Int, startTick: Long, lengthTicks: Long): NoteDraft? =
+        session?.newNote(pitch, startTick, lengthTicks)
+
+    fun noteDraftAt(index: Int): NoteDraft? =
+        session?.notes?.idAt(index)?.let { id -> session?.get(id) }?.let { NoteDraft.of(it) }
+
+    /** Commits a finished drag on the note at [index]. */
+    fun commitDrag(index: Int, draft: NoteDraft, minLengthTicks: Long) {
+        val current = session ?: return
+        val id = current.notes.idAt(index) ?: return
+        applyEdit(EditCommand.Replace(id, draft.toNote(minLengthTicks)))
+    }
+
+    fun insertNote(draft: NoteDraft, minLengthTicks: Long) {
+        applyEdit(EditCommand.Insert(draft.toNote(minLengthTicks)))
+    }
+
+    fun deleteSelected() {
+        val id = selectedId ?: return
+        applyEdit(EditCommand.Delete(id), keepSelection = false)
+    }
+
+    fun nudgePitch(semitones: Int) = nudgeSelected { draft ->
+        draft.copy(pitch = draft.pitch + semitones)
+    }
+
+    fun nudgeStart(steps: Int) = nudgeSelected { draft ->
+        val step = gridStep()
+        draft.copy(
+            startTick = draft.startTick + steps * step,
+            endTick = draft.endTick + steps * step,
+        )
+    }
+
+    fun nudgeLength(steps: Int) = nudgeSelected { draft ->
+        draft.copy(endTick = draft.endTick + steps * gridStep())
+    }
+
+    private fun gridStep(): Long {
+        val grid = _state.value.snapGrid
+        return if (grid.isFree) 1L else grid.unitTicks(ticksPerQuarter)
+    }
+
+    private fun nudgeSelected(transform: (NoteDraft) -> NoteDraft) {
+        val current = session ?: return
+        val id = selectedId ?: return
+        val note = current[id] ?: return
+        val minLength = if (_state.value.snapGrid.isFree) 1L else gridStep()
+        applyEdit(EditCommand.Replace(id, transform(NoteDraft.of(note)).toNote(minLength)))
+    }
+
+    fun undo() {
+        val id = session?.undo() ?: return
+        selectedId = id
+        afterEdit()
+    }
+
+    fun redo() {
+        val id = session?.redo() ?: return
+        selectedId = id
+        afterEdit()
+    }
+
+    private fun applyEdit(command: EditCommand, keepSelection: Boolean = true) {
+        val current = session ?: return
+        val id = current.apply(command) ?: return
+        selectedId = if (keepSelection) id else null
+        afterEdit()
+    }
+
+    /**
+     * Rebuilds everything downstream of an edit, exactly once.
+     *
+     * Rebuilding [HighwayModel] walks the whole bar grid, so this is a
+     * per-gesture cost, never a per-frame one — which is why drags are drawn as
+     * a ghost and only committed when the finger lifts.
+     */
+    private fun afterEdit() {
+        val current = session ?: return
+        piece = current.toPiece()
+        val note = selectedId?.let { current[it] }
+        val index = selectedId?.let { current.notes.indexOf(it) } ?: -1
+
+        _state.value = _state.value.copy(
+            model = HighwayModel(piece),
+            selectedIndex = if (note == null) -1 else index,
+            selectedNote = note,
+            canUndo = current.canUndo,
+            canRedo = current.canRedo,
+            editDirty = current.isDirty,
+            editSaved = false,
+            editError = null,
+        )
+
+        viewModelScope.launch { engine.updatePiece(piece) }
+    }
+
+    fun saveEdits() {
+        val song = _state.value.song ?: return
+        val current = session ?: return
+        viewModelScope.launch {
+            repository.saveEditedPiece(song, current.toPiece())
+                .onSuccess { saved ->
+                    // A fresh session over the saved piece: the file on disk is
+                    // now the baseline, so "unsaved changes" must start empty
+                    // again and undo must not step back across the save.
+                    session = EditSession(piece)
+                    selectedId = null
+                    _state.value = _state.value.copy(
+                        song = saved,
+                        hasScore = saved.scoreFileName != null,
+                        editDirty = false,
+                        canUndo = false,
+                        canRedo = false,
+                        selectedIndex = -1,
+                        selectedNote = null,
+                        hasImportedBackup = repository.hasImportedBackup(saved),
+                        editSaved = true,
+                        editError = null,
+                    )
+                }
+                .onFailure { error ->
+                    _state.value = _state.value.copy(
+                        editError = error.message ?: "Those edits couldn't be saved.",
+                    )
+                }
+        }
+    }
+
+    /** Throws away every edit since the last save and leaves edit mode. */
+    fun discardEdits() {
+        val song = _state.value.song ?: return
+        viewModelScope.launch {
+            repository.loadPiece(song)
+                .onSuccess { loaded ->
+                    val score = repository.loadScore(song)
+                    piece = if (score != null) enrichWithScore(loaded, score) else loaded
+                    engine.updatePiece(piece)
+                    _state.value = _state.value.copy(model = HighwayModel(piece))
+                    leaveEditMode()
+                }
+                .onFailure { leaveEditMode() }
+        }
+    }
+
+    /** Puts the imported file back, undoing every edit ever saved. */
+    fun revertToImported() {
+        val song = _state.value.song ?: return
+        viewModelScope.launch {
+            repository.revertToImported(song)
+                .onSuccess { restored ->
+                    val loaded = repository.loadPiece(restored).getOrNull() ?: return@onSuccess
+                    val score = repository.loadScore(restored)
+                    piece = if (score != null) enrichWithScore(loaded, score) else loaded
+                    engine.updatePiece(piece)
+                    session = EditSession(piece)
+                    selectedId = null
+                    _state.value = _state.value.copy(
+                        song = restored,
+                        model = HighwayModel(piece),
+                        selectedIndex = -1,
+                        selectedNote = null,
+                        canUndo = false,
+                        canRedo = false,
+                        editDirty = false,
+                        hasImportedBackup = repository.hasImportedBackup(restored),
+                        editSaved = false,
+                        editError = null,
+                    )
+                }
+                .onFailure { error ->
+                    _state.value = _state.value.copy(
+                        editError = error.message ?: "Couldn't go back to the imported version.",
+                    )
+                }
+        }
+    }
+
+    fun dismissEditMessage() {
+        if (_state.value.editError != null || _state.value.editSaved) {
+            _state.value = _state.value.copy(editError = null, editSaved = false)
+        }
+    }
+
+    /** Saves, then leaves edit mode — the answer to the unsaved-changes prompt. */
+    fun saveAndLeaveEdit() {
+        val song = _state.value.song ?: return
+        val current = session ?: return
+        _state.value = _state.value.copy(confirmLeavingEdit = false)
+        viewModelScope.launch {
+            repository.saveEditedPiece(song, current.toPiece())
+                .onSuccess { saved ->
+                    _state.value = _state.value.copy(song = saved, editSaved = true)
+                    leaveEditMode()
+                }
+                .onFailure { error ->
+                    _state.value = _state.value.copy(
+                        editError = error.message ?: "Those edits couldn't be saved.",
+                    )
+                }
+        }
     }
 
     /**

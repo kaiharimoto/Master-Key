@@ -38,6 +38,23 @@ range, hands separate, count-in and metronome, and a tempo drill that alternates
 fast and slow rather than ramping monotonically upward — which is what the
 evidence actually supports.
 
+**Edit the notes by touch.** Downloaded MIDI files are full of wrong notes,
+missing ties and passages nobody would play that way. Edit mode lets you fix
+them on the falling notes themselves: tap a note to select and hear it, drag its
+body to move it in time and pitch, drag either end to lengthen or shorten it,
+press and hold an empty lane to add one. A snap grid from 1/4 down to 1/32 —
+triplets included, or off entirely — decides how a note lands, pinch zooms the
+timeline in until a 1/32 is a comfortable target, and the nudge buttons move the
+selection by exactly one step or one semitone when a fingertip is not precise
+enough. Undo and redo throughout.
+
+Saving rewrites the song's MIDI, so playback, the highway and the library all
+agree about what the notes are. The file you imported is kept, and **Revert**
+brings it back at any time — which matters, because a rewritten file carries
+the notes and nothing else: sustain pedal, other instruments and any text in the
+original are not preserved. The engraved sheet music also goes on showing the
+score you imported rather than your edits, and edit mode says so on screen.
+
 ## Installing
 
 Download the APK from the [latest release][releases] and open it on your tablet.
