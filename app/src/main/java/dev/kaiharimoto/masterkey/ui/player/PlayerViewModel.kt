@@ -16,6 +16,7 @@ import dev.kaiharimoto.masterkey.core.edit.EditCommand
 import dev.kaiharimoto.masterkey.core.edit.EditSession
 import dev.kaiharimoto.masterkey.core.edit.NoteDraft
 import dev.kaiharimoto.masterkey.core.edit.NoteId
+import dev.kaiharimoto.masterkey.core.edit.Rebase
 import dev.kaiharimoto.masterkey.core.edit.SnapGrid
 import dev.kaiharimoto.masterkey.core.keyboard.RangeSection
 import dev.kaiharimoto.masterkey.core.midi.MidiWriter
@@ -145,7 +146,15 @@ class PlayerViewModel(
      * through Compose state would recompose the player on every frame. The value
      * comes from the audio clock, so it cannot drift from what is being heard.
      */
-    fun positionTicks(): Long = editViewTick ?: scrubTick ?: engine.positionTickNow()
+    fun positionTicks(): Long {
+        // The edit view is a held still frame, so it can only ever be right while
+        // nothing is moving. Playing with it still set draws a frozen highway
+        // over advancing audio — the notes are heard but never fall — so the
+        // playhead wins outright rather than relying on every transport action
+        // remembering to clear it.
+        if (!_state.value.isPlaying) editViewTick?.let { return it }
+        return scrubTick ?: engine.positionTickNow()
+    }
 
     /**
      * Where the view is looking while editing, which may be before the piece starts.
@@ -413,21 +422,42 @@ class PlayerViewModel(
     }
 
     fun togglePlay() {
+        leavePreRoll()
         if (_state.value.isPlaying) engine.pause() else engine.play()
     }
 
-    fun restart() = engine.stop()
+    fun restart() {
+        leavePreRoll()
+        engine.stop()
+    }
 
-    fun seekTo(tick: Long) = engine.seek(tick)
+    fun seekTo(tick: Long) {
+        leavePreRoll()
+        engine.seek(tick)
+    }
 
     /** Jumps [delta] bars from wherever the playhead is now. */
     fun seekByBars(delta: Int) {
         val model = _state.value.model ?: return
         val bar = (model.barNumberAt(positionTicks()) + delta).coerceIn(1, model.barCount)
+        leavePreRoll()
         engine.seek(model.tickOfBar(bar))
     }
 
-    fun seekToEnd() = engine.seek(piece.endTick)
+    fun seekToEnd() {
+        leavePreRoll()
+        engine.seek(piece.endTick)
+    }
+
+    /**
+     * Gives the view back to the playhead.
+     *
+     * Called by every transport action: asking for a position is asking to look
+     * at it, and a held pre-roll frame would otherwise sit on top of the answer.
+     */
+    private fun leavePreRoll() {
+        editViewTick = null
+    }
 
     /**
      * Takes the playhead under manual control.
@@ -492,6 +522,10 @@ class PlayerViewModel(
         // where it was. There is nothing before bar 1 to seek to yet.
         if (editViewTick != null) {
             scrubTick = null
+            // Cleared without resuming. Playback belongs to where the transport
+            // still is, not to the empty space now being looked at — and a flag
+            // left set here would hand a later scrub a resume it never asked for.
+            resumeAfterScrub = false
             _state.value = _state.value.copy(scrubbing = false)
             return
         }
@@ -869,7 +903,7 @@ class PlayerViewModel(
     fun commitDrag(index: Int, draft: NoteDraft, minLengthTicks: Long) {
         val current = session ?: return
         val id = current.notes.idAt(index) ?: return
-        applyEdit(EditCommand.Replace(id, draft.toNote(minLengthTicks)))
+        applyEditsShiftingIfNeeded(listOf(id to draft), minLengthTicks)
     }
 
     /** Commits a drag that moved the whole selection by one offset. */
@@ -884,35 +918,61 @@ class PlayerViewModel(
         }
     }
 
+    /**
+     * Adds [draft] to the piece, making room in front of it if that is where it
+     * landed.
+     */
     fun insertNote(draft: NoteDraft, minLengthTicks: Long) {
+        applyEditsShiftingIfNeeded(listOf(null to draft), minLengthTicks)
+    }
+
+    /**
+     * Applies a set of edits as one undoable step, shifting the whole piece
+     * later first if any of them reaches in front of bar 1.
+     *
+     * A null id means an insert; any other id replaces that note.
+     *
+     * Everything that moves a note goes through here rather than straight to
+     * [applyEdit], because making room is not a property of any one gesture: a
+     * note can arrive before the start by being drawn there, dragged there,
+     * nudged there or carried there with the rest of a selection. Four paths
+     * that each had to remember to rebase would be four chances to forget —
+     * v1.6.0 shipped with only one of them even trying.
+     */
+    private fun applyEditsShiftingIfNeeded(
+        edits: List<Pair<NoteId?, NoteDraft>>,
+        minLengthTicks: Long,
+    ) {
         val current = session ?: return
-        // A note dropped in the pre-roll is what turns that empty space into
-        // real bars: the piece shifts later so the note lands at or after zero,
-        // and the shift and the insert undo together as one step.
-        if (draft.startTick < 0L) {
-            val perBar = piece.timeSignatureAt(0)
-                .ticksPerBar(ticksPerQuarter)
-                .coerceAtLeast(1L)
-            val bars = (-draft.startTick + perBar - 1) / perBar
-            val shift = bars * perBar
-            val moved = draft.copy(
-                startTick = draft.startTick + shift,
-                endTick = draft.endTick + shift,
-            )
-            applyEdit(
-                EditCommand.Batch(
-                    listOf(
-                        EditCommand.Rebase(shift),
-                        EditCommand.Insert(moved.toNote(minLengthTicks)),
-                    ),
-                ),
-            )
-            // The view was looking at empty space that is now bar 1.
-            editViewTick = null
-            _state.value = _state.value.copy(startOffsetTicks = current.offsetTicks)
+        val shifted = Rebase.commandFor(
+            edits = edits,
+            minLengthTicks = minLengthTicks,
+            ticksPerBar = piece.timeSignatureAt(0).ticksPerBar(ticksPerQuarter),
+        ) ?: return
+
+        applyEdit(shifted.command)
+        if (shifted.shiftTicks > 0L) followRebase(shifted.shiftTicks, current)
+    }
+
+    /**
+     * Keeps the view on the music after the piece has moved out from under it.
+     *
+     * The bar being looked at is [shift] ticks later than it was, so staying at
+     * the same tick would read as the view jumping backwards by exactly the room
+     * that was just made. Once the shift has carried the view back inside the
+     * piece there is a real tick to play from, so the transport goes there too.
+     */
+    private fun followRebase(shift: Long, current: EditSession) {
+        _state.value = _state.value.copy(
+            startOffsetTicks = (_state.value.song?.startOffsetTicks ?: 0L) + current.offsetTicks,
+        )
+        val moved = (editViewTick ?: return) + shift
+        if (moved < 0L) {
+            editViewTick = moved
             return
         }
-        applyEdit(EditCommand.Insert(draft.toNote(minLengthTicks)))
+        editViewTick = null
+        engine.seek(moved)
     }
 
     fun deleteSelected() {
@@ -962,13 +1022,10 @@ class PlayerViewModel(
         val current = session ?: return
         if (selectedIds.isEmpty()) return
         val minLength = if (_state.value.snapGrid.isFree) 1L else gridStep()
-        val commands = selectedIds.mapNotNull { id ->
-            current[id]?.let { note ->
-                EditCommand.Replace(id, transform(NoteDraft.of(note)).toNote(minLength))
-            }
+        val drafts = selectedIds.mapNotNull { id ->
+            current[id]?.let { note -> id to transform(NoteDraft.of(note)) }
         }
-        if (commands.isEmpty()) return
-        applyEdit(EditCommand.Batch(commands))
+        applyEditsShiftingIfNeeded(drafts, minLength)
     }
 
     fun undo() {

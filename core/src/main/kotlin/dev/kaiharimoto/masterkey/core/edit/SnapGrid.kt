@@ -53,12 +53,19 @@ enum class SnapGrid(
      * a pickup bar or a mid-piece change of metre has its beats displaced from
      * the top of the file, and snapping to absolute tick 0 would place every
      * note after the change fractionally off the beat.
+     *
+     * [minTick] is the floor. It defaults to zero, which is right everywhere
+     * inside a piece — but it has to be a parameter rather than a hardcoded
+     * clamp, because editing can reach *before* the start of the piece to make
+     * room there. Hardcoding it is what made the whole pre-roll feature dead
+     * code in v1.6.0: the rebase that runs when a note lands at a negative tick
+     * could never fire, because no note could ever land at one.
      */
-    fun snap(tick: Long, ticksPerQuarter: Int, anchor: Long = 0L): Long {
-        if (isFree) return tick.coerceAtLeast(0L)
+    fun snap(tick: Long, ticksPerQuarter: Int, anchor: Long = 0L, minTick: Long = 0L): Long {
+        if (isFree) return tick.coerceAtLeast(minTick)
         val unit = unitTicks(ticksPerQuarter)
         val steps = ((tick - anchor).toDouble() / unit).roundToLong()
-        return (anchor + steps * unit).coerceAtLeast(0L)
+        return (anchor + steps * unit).coerceAtLeast(minTick)
     }
 
     companion object {

@@ -146,4 +146,71 @@ class NoteDragTest {
 
         assertThat(drawn.endTick).isEqualTo(1080)
     }
+
+    // ---- the pre-roll floor ----
+
+    /** Four bars of four-four, the room edit mode offers in front of bar 1. */
+    private val preRoll = -(ppq * 4L * 4)
+
+    @Test
+    fun `a note drawn in the pre-roll keeps its negative tick`() {
+        // It has to arrive negative for anything downstream to know room is
+        // needed. Clamping it here is what made the feature unreachable.
+        val drawn = NoteDrag.drawn(
+            pitch = 60,
+            startTick = -500,
+            toTick = -100,
+            velocity = 70,
+            hand = Hand.RIGHT,
+            grid = SnapGrid.SIXTEENTH,
+            ticksPerQuarter = ppq,
+            anchor = 0L,
+            minTick = preRoll,
+        )
+
+        assertThat(drawn.startTick).isEqualTo(-480)
+        assertThat(drawn.endTick).isEqualTo(-120)
+    }
+
+    @Test
+    fun `a note dragged before the start of the piece goes there`() {
+        val moved = NoteDrag.apply(
+            original = note.copy(startTick = 0, endTick = 480),
+            zone = DragZone.BODY,
+            deltaTicks = -960,
+            pitch = note.pitch,
+            grid = SnapGrid.SIXTEENTH,
+            ticksPerQuarter = ppq,
+            anchor = 0L,
+            minTick = preRoll,
+        )
+
+        assertThat(moved.startTick).isEqualTo(-960)
+        assertThat(moved.lengthTicks).isEqualTo(480)
+    }
+
+    @Test
+    fun `a drag cannot go further back than there is room drawn`() {
+        // Scrolling into unbounded blank space is just being lost, so the floor
+        // is the pre-roll that is actually on screen.
+        val moved = NoteDrag.apply(
+            original = note,
+            zone = DragZone.BODY,
+            deltaTicks = -100_000,
+            pitch = note.pitch,
+            grid = SnapGrid.SIXTEENTH,
+            ticksPerQuarter = ppq,
+            anchor = 0L,
+            minTick = preRoll,
+        )
+
+        assertThat(moved.startTick).isEqualTo(preRoll)
+    }
+
+    @Test
+    fun `without a floor a drag still stops at the start of the piece`() {
+        val moved = drag(DragZone.BODY, deltaTicks = -100_000)
+
+        assertThat(moved.startTick).isEqualTo(0)
+    }
 }

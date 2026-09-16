@@ -33,6 +33,11 @@ annotated notation helps beginners, but only when it is an explicit transitional
 scaffold — left on permanently it becomes a crutch. So it is arranged as a
 visible path towards reading unaided, and note names can fade as you improve.
 
+**Getting around a long piece.** Drag anywhere on the falling notes to scroll
+the music past the key line, hearing it as it goes. A narrow strip down each
+edge does the same thing much faster: half the height of the pane is the whole
+song, so a single sweep gets from the first bar to the last without letting go.
+
 **Practice tools.** Tempo from 25% to 125% with no pitch change, loop any bar or
 range, hands separate, count-in and metronome, and a tempo drill that alternates
 fast and slow rather than ramping monotonically upward — which is what the
@@ -55,8 +60,9 @@ the other hand or deleted in one go — and taken back with one press of Undo. A
 hand you set by hand stays set, even on a song whose sheet music says otherwise.
 
 The piece does not have to start where it starts: scroll up past bar 1 into the
-empty space in front of it and drop a note there, and the music shifts back to
-make room for the pickup or the introduction you wanted.
+empty space in front of it and put a note there — drawn, dragged or nudged back
+out of the first bar — and the music shifts along to make room for the pickup or
+the introduction you wanted.
 
 Saving rewrites the song's MIDI, so playback, the highway and the library all
 agree about what the notes are. The file you imported is kept, and **Revert**

@@ -57,6 +57,16 @@ object HighwayColors {
 
     /** The empty space before bar 1, offered for a pickup or an introduction. */
     val editPreRoll = Color(0xFF12151C)
+
+    /**
+     * The fast-seek strips down each edge.
+     *
+     * Deliberately not a hand colour: amber and teal mean "which hand" on the
+     * falling note, on the notehead and on the key, and a control that borrowed
+     * one would be saying something about the music that it does not mean.
+     */
+    val edgeStrip = Color(0xFF151A23)
+    val edgeStripMarker = Color(0x59E8ECF5)
 }
 
 private val DarkScheme = darkColorScheme(

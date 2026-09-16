@@ -142,13 +142,15 @@ object NoteDrag {
         grid: SnapGrid,
         ticksPerQuarter: Int,
         anchor: Long,
+        /** How far before the piece a drag may reach; see the pre-roll. */
+        minTick: Long = 0L,
     ): NoteDraft {
         val minLength = minLengthTicks(grid, ticksPerQuarter)
         return when (zone) {
             // Moving keeps the length and snaps the start, so a phrase dragged
             // to a different beat arrives with its rhythm intact.
             DragZone.BODY -> {
-                val start = grid.snap(original.startTick + deltaTicks, ticksPerQuarter, anchor)
+                val start = grid.snap(original.startTick + deltaTicks, ticksPerQuarter, anchor, minTick)
                 original.copy(
                     pitch = pitch,
                     startTick = start,
@@ -158,7 +160,7 @@ object NoteDrag {
 
             // The bottom edge. Trimming the front must not walk past the back.
             DragZone.START -> {
-                val start = grid.snap(original.startTick + deltaTicks, ticksPerQuarter, anchor)
+                val start = grid.snap(original.startTick + deltaTicks, ticksPerQuarter, anchor, minTick)
                     .coerceAtMost(original.endTick - minLength)
                 original.copy(startTick = start)
             }
@@ -196,10 +198,13 @@ object NoteDrag {
         grid: SnapGrid,
         ticksPerQuarter: Int,
         anchor: Long,
+        /** How far before the piece a new note may be drawn; see the pre-roll. */
+        minTick: Long = 0L,
     ): NoteDraft {
-        val start = grid.snap(startTick, ticksPerQuarter, anchor)
+        val start = grid.snap(startTick, ticksPerQuarter, anchor, minTick)
         val minLength = newNoteLength(grid, ticksPerQuarter)
-        val end = grid.snap(toTick, ticksPerQuarter, anchor).coerceAtLeast(start + minLength)
+        val end = grid.snap(toTick, ticksPerQuarter, anchor, minTick)
+            .coerceAtLeast(start + minLength)
         return NoteDraft(
             pitch = pitch,
             startTick = start,

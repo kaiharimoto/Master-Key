@@ -179,6 +179,7 @@ fun NoteHighway(
 
     val handlePx = with(density) { GRIP_DEPTH.toPx() }
     val minTouchPx = with(density) { MIN_TOUCH_TARGET.toPx() }
+    val stripDepthPx = with(density) { EDGE_STRIP_WIDTH.toPx() }
 
     Canvas(
         modifier = modifier.pointerInput(model, editing, onSeekToTick, onKeyTapped, onScrubTo) {
@@ -230,6 +231,19 @@ fun NoteHighway(
                     HighwayHitTest.NONE
                 }
 
+                // A narrow strip down each edge, where a vertical drag covers
+                // the whole piece rather than a paneful of it.
+                //
+                // Claimed only where nothing else wants the touch. A note under
+                // the finger always wins — `hitIndex` is already resolved here,
+                // so the outermost lanes stay as editable as any other — and the
+                // lasso wins too, so a marquee can still be swept from the very
+                // edge of the pane.
+                val stripPx = min(stripDepthPx, size.width * MAX_STRIP_SHARE)
+                val inStrip = hitIndex == HighwayHitTest.NONE &&
+                    !latestSelectMode &&
+                    (down.position.x <= stripPx || down.position.x >= size.width - stripPx)
+
                 // Resolving what the gesture *is* has to be a hand-rolled loop.
                 // The stock helpers each wait for exactly one outcome and give no
                 // chance to bail out; here a second finger, the touch slop and the
@@ -239,6 +253,7 @@ fun NoteHighway(
                     editing = editing,
                     overANote = hitIndex != HighwayHitTest.NONE,
                     selectMode = latestSelectMode,
+                    inStrip = inStrip,
                 )
 
                 when (intent) {
@@ -285,6 +300,7 @@ fun NoteHighway(
                             anchorDraft = onDraftAt?.invoke(hitIndex),
                             pixelsPerTick = pixelsPerTick,
                             edit = edit,
+                            minTick = -preRollTicks,
                             onCommitGroupDrag = onCommitGroupDrag,
                         )
                     } else runNoteDrag(
@@ -301,6 +317,7 @@ fun NoteHighway(
                         pixelsPerTick = pixelsPerTick,
                         handlePx = handlePx,
                         edit = edit,
+                        minTick = -preRollTicks,
                         onSelect = onSelect,
                         onDraftAt = onDraftAt,
                         onCommitDrag = onCommitDrag,
@@ -319,6 +336,7 @@ fun NoteHighway(
                         keyLineY = keyLineY,
                         pixelsPerTick = pixelsPerTick,
                         edit = edit,
+                        minTick = -preRollTicks,
                         onNewNoteDraft = onNewNoteDraft,
                         onInsertNote = onInsertNote,
                         onKeyTapped = onAudition ?: onKeyTapped,
@@ -337,6 +355,32 @@ fun NoteHighway(
                             // to the drag.
                             tick -= change.positionChange().y / pixelsPerTick
                             scrubTo(tick.toLong().coerceAtLeast(-preRollTicks))
+                            change.consume()
+                        }
+                        onScrubEnd?.invoke()
+                    }
+
+                    Intent.STRIP_SCRUB -> {
+                        val scrubTo = onScrubTo ?: return@awaitEachGesture
+                        val endTick = model.piece.endTick
+                        var tick = positionTicks.longValue.toFloat()
+                        // Sounds what it passes, like the ordinary scrub. The
+                        // preview bounds itself to a handful of notes nearest
+                        // where the finger is, which is what keeps a sweep this
+                        // fast from arriving as one enormous chord.
+                        onScrubStart?.invoke()
+                        verticalDrag(down.id) { change ->
+                            tick += HighwayHitTest.fastScrubDelta(
+                                dy = change.positionChange().y,
+                                keyLineY = keyLineY,
+                                endTick = endTick,
+                            )
+                            // Clamped as it accumulates, not only where it is
+                            // read: at this gain an overshoot past either end
+                            // would otherwise have to be dragged back through
+                            // before anything moved again.
+                            tick = tick.coerceIn(-preRollTicks.toFloat(), endTick.toFloat())
+                            scrubTo(tick.toLong())
                             change.consume()
                         }
                         onScrubEnd?.invoke()
@@ -400,18 +444,38 @@ fun NoteHighway(
         // emptiness reads as room you may use rather than as a failure to draw.
         if (preRollTicks > 0L) {
             val startY = HighwayHitTest.yAt(0L, position, keyLineY, pixelsPerTick)
-            // Only when the start of the piece is actually on screen. Without the
-            // upper bound the rectangle gets a negative height as soon as the
-            // playhead moves past bar 1.
-            if (startY > 0f && startY < keyLineY) {
+            // Anything above the key line is pre-roll, whether or not bar 1 is
+            // still on screen — scroll far enough back and it fills the pane, and
+            // a guard that also demanded a visible bar line turned the tint off
+            // at exactly the point there was nothing else to say where you were.
+            if (startY < keyLineY) {
+                val top = startY.coerceAtLeast(0f)
                 drawRect(
                     color = HighwayColors.editPreRoll,
-                    topLeft = Offset(0f, startY),
-                    size = Size(width, keyLineY - startY),
+                    topLeft = Offset(0f, top),
+                    size = Size(width, keyLineY - top),
                 )
-                drawRect(HighwayColors.barLine, Offset(0f, startY), Size(width, 2f))
+                if (startY > 0f) {
+                    drawRect(HighwayColors.barLine, Offset(0f, startY), Size(width, 2f))
+                }
             }
         }
+
+        // The fast-seek strips. Under the notes, the grid and the loop bracket —
+        // painted on top they would dim the outermost lanes, which are a whole
+        // white key wide on a two-octave view — but over the pre-roll tint,
+        // which covers the full width and would otherwise swallow them exactly
+        // where a long seek back is most likely to start.
+        drawEdgeStrips(
+            width = width,
+            keyLineY = keyLineY,
+            stripPx = min(stripDepthPx, width * MAX_STRIP_SHARE),
+            position = position,
+            endTick = model.piece.endTick,
+            // Inset in edit mode so the strip and the edit border read as two
+            // things rather than one thick frame.
+            inset = if (editing) EDIT_BORDER_PX else 0f,
+        )
 
         if (settings.showBeatGrid) {
             drawGrid(model, position, lookAheadTicks, pixelsPerTick, keyLineY, width, labelCache)
@@ -512,6 +576,39 @@ fun NoteHighway(
     }
 }
 
+/**
+ * The fast-seek strips, and where in the piece you are.
+ *
+ * Subtle on purpose: a shade lifted from the background, which is enough to say
+ * the edges are a control without competing with the notes. The marker is what
+ * makes it a map of the song rather than a border — without it there is nothing
+ * to say how far a sweep would have to go.
+ */
+private fun DrawScope.drawEdgeStrips(
+    width: Float,
+    keyLineY: Float,
+    stripPx: Float,
+    position: Long,
+    endTick: Long,
+    inset: Float,
+) {
+    val top = inset
+    val depth = stripPx - inset
+    if (depth <= 0f || keyLineY <= top) return
+
+    val band = Size(depth, keyLineY - top)
+    drawRect(HighwayColors.edgeStrip, Offset(inset, top), band)
+    drawRect(HighwayColors.edgeStrip, Offset(width - stripPx, top), band)
+
+    if (endTick <= 0L) return
+    val progress = (position.toFloat() / endTick).coerceIn(0f, 1f)
+    val markerY = (top + progress * (keyLineY - top) - EDGE_STRIP_MARKER_PX / 2f)
+        .coerceIn(top, keyLineY - EDGE_STRIP_MARKER_PX)
+    val marker = Size(depth, EDGE_STRIP_MARKER_PX)
+    drawRect(HighwayColors.edgeStripMarker, Offset(inset, markerY), marker)
+    drawRect(HighwayColors.edgeStripMarker, Offset(width - stripPx, markerY), marker)
+}
+
 /** A note as the finger currently has it, before the edit is committed. */
 private class GhostNote(val pitch: Int, val startTick: Long, val endTick: Long)
 
@@ -522,6 +619,9 @@ private enum class Intent {
 
     /** One finger, dragging the music past the key line. */
     SCRUB,
+
+    /** One finger in an edge strip: the whole piece in half a paneful. */
+    STRIP_SCRUB,
 
     /** One finger, dragging a note it landed on. */
     EDIT_DRAG,
@@ -554,6 +654,7 @@ private suspend fun AwaitPointerEventScope.awaitIntent(
     editing: Boolean,
     overANote: Boolean,
     selectMode: Boolean,
+    inStrip: Boolean,
 ): Intent {
     var travelled = Offset.Zero
     val longPressAt = System.nanoTime() + LONG_PRESS_NANOS
@@ -574,7 +675,12 @@ private suspend fun AwaitPointerEventScope.awaitIntent(
         // two-dimensional slop. Everything else scrolls the music, which is a
         // vertical gesture — and measuring it vertically is what stops a
         // sideways swipe from being read as a scrub, exactly as before.
-        val slopped = if (editing && (overANote || selectMode)) {
+        val slopped = if (inStrip) {
+            // Half the usual threshold, vertical only. The strip is a deliberate
+            // place to put a finger, so it should engage at once — and a thumb
+            // rolling sideways off the edge of a tablet must not defeat it.
+            abs(travelled.y) > viewConfiguration.touchSlop / 2f
+        } else if (editing && (overANote || selectMode)) {
             // A note drag moves sideways as well as along, and a marquee is
             // drawn in both directions, so both want two-dimensional slop.
             travelled.getDistance() > viewConfiguration.touchSlop
@@ -586,6 +692,7 @@ private suspend fun AwaitPointerEventScope.awaitIntent(
         }
         if (slopped) {
             return when {
+                inStrip -> Intent.STRIP_SCRUB
                 !editing -> Intent.SCRUB
                 overANote -> Intent.EDIT_DRAG
                 // With the lasso on, an empty-lane drag sweeps a selection
@@ -600,7 +707,11 @@ private suspend fun AwaitPointerEventScope.awaitIntent(
             }
         }
 
-        if (editing && !overANote && System.nanoTime() >= longPressAt) return Intent.CREATE
+        // Not in a strip: resting a finger on one for 400 ms should do nothing,
+        // not spawn a note in the outermost lane.
+        if (editing && !overANote && !inStrip && System.nanoTime() >= longPressAt) {
+            return Intent.CREATE
+        }
 
         change.consume()
     }
@@ -728,6 +839,8 @@ private suspend fun AwaitPointerEventScope.runNoteDrag(
     pixelsPerTick: Float,
     handlePx: Float,
     edit: HighwayEditState?,
+    /** Earliest tick the note may be dragged to: negative, out in the pre-roll. */
+    minTick: Long,
     onSelect: ((Int) -> Unit)?,
     onDraftAt: ((Int) -> NoteDraft?)?,
     onCommitDrag: ((Int, NoteDraft, Long) -> Unit)?,
@@ -770,6 +883,7 @@ private suspend fun AwaitPointerEventScope.runNoteDrag(
             grid = grid,
             ticksPerQuarter = ticksPerQuarter,
             anchor = anchor,
+            minTick = minTick,
         )
         edit?.showGhost(index, current)
 
@@ -807,6 +921,8 @@ private suspend fun AwaitPointerEventScope.runGroupDrag(
     anchorDraft: NoteDraft?,
     pixelsPerTick: Float,
     edit: HighwayEditState?,
+    /** Earliest tick the dragged note may land on; the rest follow it. */
+    minTick: Long,
     onCommitGroupDrag: ((Long, Int) -> Unit)?,
 ) {
     val anchorNote = anchorDraft ?: return
@@ -821,7 +937,7 @@ private suspend fun AwaitPointerEventScope.runGroupDrag(
         travelled += change.positionChange()
         // Snap where the dragged note lands, then keep the difference.
         val wanted = anchorNote.startTick + (-travelled.y / pixelsPerTick).toLong()
-        deltaTicks = grid.snap(wanted, ticksPerQuarter, gridAnchor) - anchorNote.startTick
+        deltaTicks = grid.snap(wanted, ticksPerQuarter, gridAnchor, minTick) - anchorNote.startTick
 
         val lane = HighwayHitTest.laneAt(layout, down.x + travelled.x, range.low, range.high)
         if (lane != null && startLane != null) deltaPitch = lane - startLane
@@ -847,6 +963,8 @@ private suspend fun AwaitPointerEventScope.runNoteDraw(
     keyLineY: Float,
     pixelsPerTick: Float,
     edit: HighwayEditState?,
+    /** Earliest tick a note may be drawn at: negative, out in the pre-roll. */
+    minTick: Long,
     onNewNoteDraft: ((Int, Long, Long) -> NoteDraft?)?,
     onInsertNote: ((NoteDraft, Long) -> Unit)?,
     onKeyTapped: ((Int) -> Unit)?,
@@ -866,6 +984,7 @@ private suspend fun AwaitPointerEventScope.runNoteDraw(
         grid = grid,
         ticksPerQuarter = ticksPerQuarter,
         anchor = anchor,
+        minTick = minTick,
     )
     edit?.showGhost(HighwayEditState.NO_DRAG, current)
     onKeyTapped?.invoke(pitch)
@@ -883,6 +1002,7 @@ private suspend fun AwaitPointerEventScope.runNoteDraw(
             grid = grid,
             ticksPerQuarter = ticksPerQuarter,
             anchor = anchor,
+            minTick = minTick,
         )
         edit?.showGhost(HighwayEditState.NO_DRAG, current)
         change.consume()
@@ -1373,6 +1493,17 @@ private const val LONG_PRESS_NANOS = 400_000_000L
 private const val SELECTION_STROKE_PX = 2.5f
 private const val GRIP_BAR_PX = 3f
 private const val EDIT_BORDER_PX = 3f
+
+/**
+ * How wide the fast-seek strips are, and how much of the pane they may take.
+ *
+ * The share is the guard that matters: two fixed-width strips would eat a large
+ * fraction of a narrow highway in a split pane, and a highway you cannot edit at
+ * the edges is a worse trade than a strip that is slightly harder to hit.
+ */
+private val EDGE_STRIP_WIDTH = 28.dp
+private const val MAX_STRIP_SHARE = 0.08f
+private const val EDGE_STRIP_MARKER_PX = 3f
 
 /** Below this, subdivision lines stop being a grid and become a grey wash. */
 private const val MIN_SNAP_LINE_GAP_PX = 6f

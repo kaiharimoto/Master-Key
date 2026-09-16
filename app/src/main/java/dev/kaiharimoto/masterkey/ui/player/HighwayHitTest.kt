@@ -196,6 +196,26 @@ object HighwayHitTest {
         }
     }
 
+    /**
+     * Ticks to travel for a vertical drag of [dy] pixels inside an edge strip.
+     *
+     * Half the pane is the whole piece: a sweep from the middle of the highway
+     * down to the key line covers the song end to end, which is the point of the
+     * strips — the ordinary scrub moves at the look-ahead's rate, a few beats per
+     * paneful, so crossing a long piece with it means dragging, lifting and
+     * dragging again a dozen times.
+     *
+     * The sign matches the ordinary scrub: notes fall downwards, so dragging
+     * down pulls earlier music back into view.
+     */
+    fun fastScrubDelta(dy: Float, keyLineY: Float, endTick: Long): Float {
+        val span = keyLineY / 2f
+        // A pane with no height above the keyboard is not a control; returning
+        // zero is the only answer that is not a division by it.
+        if (span <= 0f) return 0f
+        return -(dy / span) * endTick
+    }
+
     /** True when the note is tall enough for its grips to be worth drawing. */
     fun hasGrips(topY: Float, bottomY: Float, handlePx: Float): Boolean =
         bottomY - topY >= handlePx * MIN_ZONES

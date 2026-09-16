@@ -48,9 +48,31 @@ class SnapGridTest {
     }
 
     @Test
-    fun `snapping never goes negative`() {
+    fun `snapping never goes negative by default`() {
         assertThat(SnapGrid.QUARTER.snap(-500, 480)).isAtLeast(0)
         assertThat(SnapGrid.FREE.snap(-1, 480)).isEqualTo(0)
+    }
+
+    @Test
+    fun `a floor below zero lets a tick go before the start of the piece`() {
+        // Editing can reach into the empty space in front of bar 1 to make room
+        // there. A hardcoded clamp at zero here is what turned that whole
+        // feature into dead code in v1.6.0: nothing could ever land at a
+        // negative tick, so the branch that made room could never fire.
+        val preRoll = -480L * 4 * 4
+
+        assertThat(SnapGrid.QUARTER.snap(-500, 480, minTick = preRoll)).isEqualTo(-480)
+        assertThat(SnapGrid.SIXTEENTH.snap(-70, 480, minTick = preRoll)).isEqualTo(-120)
+        assertThat(SnapGrid.EIGHTH_TRIPLET.snap(-170, 480, minTick = preRoll)).isEqualTo(-160)
+        assertThat(SnapGrid.FREE.snap(-1, 480, minTick = preRoll)).isEqualTo(-1)
+    }
+
+    @Test
+    fun `the floor is a floor, on every grid`() {
+        val floor = -960L
+        for (grid in SnapGrid.entries) {
+            assertThat(grid.snap(-5_000, 480, minTick = floor)).isEqualTo(floor)
+        }
     }
 
     @Test

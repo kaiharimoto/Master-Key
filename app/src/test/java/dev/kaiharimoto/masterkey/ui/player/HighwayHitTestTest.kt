@@ -191,4 +191,47 @@ class HighwayHitTestTest {
         assertThat(HighwayHitTest.laneAt(layout, layout.centerOf(61), 60, 72)).isEqualTo(61)
         assertThat(HighwayHitTest.laneAt(layout, layout.centerOf(60), 60, 72)).isEqualTo(60)
     }
+
+    // ---- the edge strips ----
+
+    @Test
+    fun `half the pane covers the whole piece`() {
+        // The gain that makes the strips worth having: one sweep from the middle
+        // of the highway to the key line crosses the song end to end.
+        val endTick = 120_000L
+
+        val delta = HighwayHitTest.fastScrubDelta(-keyLineY / 2f, keyLineY, endTick)
+
+        assertThat(delta).isWithin(1f).of(endTick.toFloat())
+    }
+
+    @Test
+    fun `the strip drags the same way round as an ordinary scrub`() {
+        // Notes fall downwards, so dragging down pulls earlier music back into
+        // view — the same direction the music travels, opposite to the finger.
+        assertThat(HighwayHitTest.fastScrubDelta(40f, keyLineY, 120_000L)).isLessThan(0f)
+        assertThat(HighwayHitTest.fastScrubDelta(-40f, keyLineY, 120_000L)).isGreaterThan(0f)
+    }
+
+    @Test
+    fun `a quarter of the pane is half the piece`() {
+        val endTick = 120_000L
+
+        val delta = HighwayHitTest.fastScrubDelta(-keyLineY / 4f, keyLineY, endTick)
+
+        assertThat(delta).isWithin(1f).of(endTick / 2f)
+    }
+
+    @Test
+    fun `a pane with no room above the keyboard is not a divide by zero`() {
+        assertThat(HighwayHitTest.fastScrubDelta(40f, 0f, 120_000L)).isEqualTo(0f)
+        assertThat(HighwayHitTest.fastScrubDelta(40f, -10f, 120_000L)).isEqualTo(0f)
+    }
+
+    @Test
+    fun `an empty piece has nowhere to seek to`() {
+        // isWithin rather than isEqualTo: the arithmetic hands back negative
+        // zero, which is the same number and a different Float.
+        assertThat(HighwayHitTest.fastScrubDelta(40f, keyLineY, 0L)).isWithin(0f).of(0f)
+    }
 }

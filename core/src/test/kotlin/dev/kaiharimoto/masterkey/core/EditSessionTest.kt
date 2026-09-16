@@ -4,6 +4,8 @@ import com.google.common.truth.Truth.assertThat
 import dev.kaiharimoto.masterkey.core.edit.EditCommand
 import dev.kaiharimoto.masterkey.core.edit.EditSession
 import dev.kaiharimoto.masterkey.core.edit.NoteDraft
+import dev.kaiharimoto.masterkey.core.edit.NoteId
+import dev.kaiharimoto.masterkey.core.edit.Rebase
 import dev.kaiharimoto.masterkey.core.midi.Pitch
 import dev.kaiharimoto.masterkey.core.model.Hand
 import dev.kaiharimoto.masterkey.core.model.KeySignature
@@ -435,5 +437,142 @@ class EditSessionTest {
         // The oldest edits are forgotten rather than half-applied: what remains
         // is still a valid piece, just not the one we started from.
         assertThat(session.toPiece().notes.map { it.startTick }).isInOrder()
+    }
+
+    // ---- making room in front of the piece ----
+    //
+    // These are the tests v1.6.0 did not have. It had plenty that drove
+    // `EditCommand.Rebase` straight at the session, all of which passed, while
+    // the path a finger actually takes to reach one could not run at all.
+
+    private val bar = ppq * 4L
+
+    private fun draft(start: Long, end: Long, pitch: Int = 60) =
+        NoteDraft(pitch, start, end, 80, Hand.RIGHT)
+
+    @Test
+    fun `a tick before the start shifts by a whole bar, never by less`() {
+        // Rounding to the bar is the point: a pickup belongs in a bar of its
+        // own, and an arbitrary offset would displace every bar line after it.
+        assertThat(Rebase.shiftToFit(-1, bar)).isEqualTo(bar)
+        assertThat(Rebase.shiftToFit(-bar, bar)).isEqualTo(bar)
+        assertThat(Rebase.shiftToFit(-bar - 1, bar)).isEqualTo(bar * 2)
+        assertThat(Rebase.shiftToFit(-bar * 3, bar)).isEqualTo(bar * 3)
+    }
+
+    @Test
+    fun `a tick already inside the piece shifts by nothing`() {
+        assertThat(Rebase.shiftToFit(0, bar)).isEqualTo(0)
+        assertThat(Rebase.shiftToFit(1, bar)).isEqualTo(0)
+        assertThat(Rebase.shiftToFit(10_000, bar)).isEqualTo(0)
+    }
+
+    @Test
+    fun `the shift always lands the note at or after zero`() {
+        // A bar length of zero cannot happen from a real file, but the metre is
+        // read off the piece and dividing by it must not be a crash.
+        for (perBar in listOf(0L, 1L, 160L, 720L, bar)) {
+            for (start in listOf(-1L, -7L, -bar, -bar * 5 - 3)) {
+                assertThat(start + Rebase.shiftToFit(start, perBar)).isAtLeast(0L)
+            }
+        }
+    }
+
+    @Test
+    fun `the shift honours the metre in force where the note lands`() {
+        // Three-four: the room made is three quarters, not four.
+        assertThat(Rebase.shiftToFit(-1, ppq * 3L)).isEqualTo(ppq * 3L)
+    }
+
+    @Test
+    fun `a note drawn before the start rebases the piece and inserts into the room`() {
+        // The assertion that would have caught v1.6.0: the whole reason the
+        // feature existed, and nothing asserted it end to end.
+        val shifted = Rebase.commandFor(
+            edits = listOf(null to draft(-ppq.toLong(), 0)),
+            minLengthTicks = 1,
+            ticksPerBar = bar,
+        )!!
+
+        assertThat(shifted.shiftTicks).isEqualTo(bar)
+        val batch = shifted.command as EditCommand.Batch
+        assertThat(batch.commands.first()).isEqualTo(EditCommand.Rebase(bar))
+        val inserted = (batch.commands[1] as EditCommand.Insert).note
+        assertThat(inserted.startTick).isEqualTo(bar - ppq)
+        assertThat(inserted.endTick).isEqualTo(bar)
+    }
+
+    @Test
+    fun `a note dragged before the start rebases too`() {
+        // The other half of "I cannot change where the first note begins": a
+        // note that is already in the piece, dragged earlier than bar 1.
+        val id = NoteId(7)
+        val shifted = Rebase.commandFor(
+            edits = listOf(id to draft(-240, 240)),
+            minLengthTicks = 1,
+            ticksPerBar = bar,
+        )!!
+
+        val batch = shifted.command as EditCommand.Batch
+        assertThat(batch.commands.first()).isEqualTo(EditCommand.Rebase(bar))
+        val replaced = batch.commands[1] as EditCommand.Replace
+        assertThat(replaced.id).isEqualTo(id)
+        assertThat(replaced.note.startTick).isEqualTo(bar - 240)
+    }
+
+    @Test
+    fun `a selection is shifted by its earliest note, and keeps its shape`() {
+        val first = NoteId(1)
+        val second = NoteId(2)
+        val shifted = Rebase.commandFor(
+            edits = listOf(second to draft(-240, 240, 64), first to draft(-bar, -240, 60)),
+            minLengthTicks = 1,
+            ticksPerBar = bar,
+        )!!
+
+        // One bar is enough for the earliest of them, so one bar is what is made.
+        assertThat(shifted.shiftTicks).isEqualTo(bar)
+        val batch = shifted.command as EditCommand.Batch
+        val starts = batch.commands.drop(1).map { (it as EditCommand.Replace).note.startTick }
+        assertThat(starts).containsExactly(bar - 240, 0L).inOrder()
+    }
+
+    @Test
+    fun `an edit inside the piece carries no rebase at all`() {
+        val shifted = Rebase.commandFor(
+            edits = listOf(NoteId(1) to draft(480, 960)),
+            minLengthTicks = 1,
+            ticksPerBar = bar,
+        )!!
+
+        assertThat(shifted.shiftTicks).isEqualTo(0)
+        assertThat(shifted.command).isInstanceOf(EditCommand.Replace::class.java)
+    }
+
+    @Test
+    fun `nothing to apply is nothing to do`() {
+        assertThat(Rebase.commandFor(emptyList(), 1, bar)).isNull()
+    }
+
+    @Test
+    fun `the rebase and the insert undo as one step`() {
+        // Half of it undone would leave the piece displaced with nothing in the
+        // room it made — a shift the user never asked for and cannot see.
+        val session = EditSession(pieceOf(note(60, 0, 480), endTick = 1920))
+        val before = session.toPiece().summary()
+        val shifted = Rebase.commandFor(
+            edits = listOf(null to draft(-ppq.toLong(), 0, 55)),
+            minLengthTicks = 1,
+            ticksPerBar = bar,
+        )!!
+
+        session.apply(shifted.command)
+        assertThat(session.toPiece().notes).hasSize(2)
+        assertThat(session.offsetTicks).isEqualTo(bar)
+
+        session.undo()
+
+        assertThat(session.toPiece().summary()).isEqualTo(before)
+        assertThat(session.offsetTicks).isEqualTo(0)
     }
 }

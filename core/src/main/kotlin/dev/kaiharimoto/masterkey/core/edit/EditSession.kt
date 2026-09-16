@@ -201,6 +201,78 @@ data class NoteDraft(
 }
 
 /**
+ * Working out how far a piece has to move to make room in front of it.
+ *
+ * Pure and separate so it can be tested without an Android runtime. That is not
+ * an aesthetic preference: the first cut of the pre-roll put this arithmetic
+ * behind a ViewModel, tested [EditCommand.Rebase] directly instead, and shipped
+ * a branch that could never run because a clamp three layers upstream made the
+ * negative tick impossible. The tests below drive the real decision.
+ */
+object Rebase {
+
+    /**
+     * Ticks to shift the piece so that [earliestTick] lands at or after zero.
+     *
+     * Rounded up to a whole bar, because the space being made is musical: a
+     * pickup belongs in a bar of its own, not at some arbitrary offset that
+     * leaves every bar line in the piece displaced from the grid.
+     */
+    fun shiftToFit(earliestTick: Long, ticksPerBar: Long): Long {
+        if (earliestTick >= 0L) return 0L
+        val perBar = ticksPerBar.coerceAtLeast(1L)
+        val bars = (-earliestTick + perBar - 1) / perBar
+        return bars * perBar
+    }
+
+    /** A command that makes room, and how much room it made. */
+    data class Shifted(val command: EditCommand, val shiftTicks: Long)
+
+    /**
+     * The one command that applies [edits], moving the piece out of the way
+     * first if any of them reaches in front of bar 1.
+     *
+     * A null id means an insert; any other id replaces that note. Returns null
+     * when there is nothing to apply.
+     *
+     * This lives here, whole, rather than in the ViewModel that calls it,
+     * because it is the step that has to be right and the step that cannot be
+     * tested through an Android runtime. v1.6.0's version of it sat in the
+     * ViewModel and was never run by anything: every test drove
+     * [EditCommand.Rebase] straight at the session, so a clamp further up that
+     * made the branch unreachable went unnoticed all the way to a release.
+     */
+    fun commandFor(
+        edits: List<Pair<NoteId?, NoteDraft>>,
+        minLengthTicks: Long,
+        ticksPerBar: Long,
+    ): Shifted? {
+        if (edits.isEmpty()) return null
+
+        val shift = shiftToFit(edits.minOf { (_, draft) -> draft.startTick }, ticksPerBar)
+        val commands = edits.map { (id, draft) ->
+            val placed = if (shift == 0L) {
+                draft
+            } else {
+                draft.copy(startTick = draft.startTick + shift, endTick = draft.endTick + shift)
+            }
+            val note = placed.toNote(minLengthTicks)
+            if (id == null) EditCommand.Insert(note) else EditCommand.Replace(id, note)
+        }
+
+        // The shift and the edit undo together: one press of Undo has to take
+        // back one gesture, and half of this would leave the piece displaced
+        // with nothing in the space it made.
+        val command = if (shift == 0L) {
+            commands.singleOrNull() ?: EditCommand.Batch(commands)
+        } else {
+            EditCommand.Batch(listOf(EditCommand.Rebase(shift)) + commands)
+        }
+        return Shifted(command, shift)
+    }
+}
+
+/**
  * One reversible change to the notes.
  *
  * Move, resize from either end and every inspector nudge are all [Replace] — one
