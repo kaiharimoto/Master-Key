@@ -58,6 +58,17 @@ data class SongEntity(
     @ColumnInfo(defaultValue = "1") val showScore: Boolean = true,
     @ColumnInfo(defaultValue = "8.0") val lookAheadBeats: Float = 8f,
 
+    /**
+     * How far the music has been pushed later to make room before bar 1.
+     *
+     * MIDI ticks cannot be negative, so adding space at the front means shifting
+     * the whole piece. The engraved MusicXML cannot shift with it, so this is
+     * subtracted again when driving the score cursor and when matching notes
+     * against the score — without it, every match would fail after the first
+     * rebase and the hand and fingering overlay would vanish silently.
+     */
+    @ColumnInfo(defaultValue = "0") val startOffsetTicks: Long = 0,
+
     /** Highest tempo scale reached in a completed practice run, for progress. */
     @ColumnInfo(defaultValue = "0.0") val bestTempoScale: Float = 0f,
     @ColumnInfo(defaultValue = "0") val totalPracticeMillis: Long = 0,

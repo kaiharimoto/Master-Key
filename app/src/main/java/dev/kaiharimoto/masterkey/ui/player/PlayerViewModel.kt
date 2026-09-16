@@ -79,9 +79,19 @@ data class PlayerUiState(
     /** Why this song cannot be edited, when it cannot. */
     val editBlocked: String? = null,
     val snapGrid: SnapGrid = SnapGrid.DEFAULT,
-    /** Index into `model.notes` of the selected note, or -1. */
-    val selectedIndex: Int = -1,
-    val selectedNote: Note? = null,
+    /**
+     * Indices into `model.notes` of the selected notes, ascending.
+     *
+     * A plain list rather than an `IntArray`: an array in a data class compares
+     * by identity, so `equals` would call every rebuilt selection a change and
+     * recompose the whole player. The highway turns it into an `IntArray` once
+     * per composition for its draw-phase lookups.
+     */
+    val selectedIndices: List<Int> = emptyList(),
+    /** The selected notes themselves, for the inspector. */
+    val selectedNotes: List<Note> = emptyList(),
+    /** True while the lasso is on and taps add to the selection. */
+    val selectMode: Boolean = false,
     val canUndo: Boolean = false,
     val canRedo: Boolean = false,
     /** True when there are edits that have not been written to the file. */
@@ -92,7 +102,18 @@ data class PlayerUiState(
     /** Shown after a successful save, so a silent write is still visible. */
     val editSaved: Boolean = false,
     val confirmLeavingEdit: Boolean = false,
-)
+    /**
+     * Ticks the piece has been shifted to make room before its start.
+     *
+     * Subtracted again when driving the score cursor, which cannot shift with it.
+     */
+    val startOffsetTicks: Long = 0,
+) {
+    /** The one selected note, when exactly one is. */
+    val selectedNote: Note? get() = selectedNotes.singleOrNull()
+
+    val hasSelection: Boolean get() = selectedNotes.isNotEmpty()
+}
 
 class PlayerViewModel(
     application: Application,
@@ -124,7 +145,18 @@ class PlayerViewModel(
      * through Compose state would recompose the player on every frame. The value
      * comes from the audio clock, so it cannot drift from what is being heard.
      */
-    fun positionTicks(): Long = scrubTick ?: engine.positionTickNow()
+    fun positionTicks(): Long = editViewTick ?: scrubTick ?: engine.positionTickNow()
+
+    /**
+     * Where the view is looking while editing, which may be before the piece starts.
+     *
+     * Edit mode can scroll into the empty space in front of bar 1, so that space
+     * can be used — otherwise choosing where a piece begins is a chicken-and-egg
+     * problem, since you cannot reach the room you need in order to make it. The
+     * engine is never told about a negative tick; playback is paused throughout,
+     * and a note dropped out here rebases the piece so the model never holds one.
+     */
+    @Volatile private var editViewTick: Long? = null
 
     /**
      * Position the scrubber is being dragged to, or null when it is not.
@@ -260,7 +292,7 @@ class PlayerViewModel(
         // inside a SAX handler and the notation silently never arrived.
         val scoreXml = if (song.scoreFileName != null) repository.scoreXml(song) else null
         val score = repository.loadScore(song)
-        piece = if (score != null) enrichWithScore(loaded, score) else loaded
+        piece = if (score != null) enrichWithScore(loaded, score, song.startOffsetTicks) else loaded
 
         engine.load(piece)
 
@@ -316,6 +348,7 @@ class PlayerViewModel(
             scoreXml = scoreXml?.getOrNull(),
             scoreError = scoreXml?.exceptionOrNull()
                 ?.let { describeScoreFailure(song.scoreFileName, it) },
+            startOffsetTicks = song.startOffsetTicks,
         )
 
         repository.touch(songId)
@@ -329,7 +362,11 @@ class PlayerViewModel(
      * notes are one notehead but several MIDI events. Anything that fails to
      * match simply keeps what the MIDI said.
      */
-    private fun enrichWithScore(piece: Piece, score: ScoreDocument): Piece {
+    private fun enrichWithScore(
+        piece: Piece,
+        score: ScoreDocument,
+        offsetTicks: Long = 0L,
+    ): Piece {
         if (score.soundingNotes.isEmpty()) return piece
         if (!score.hasTwoStaves && !score.hasFingering) return piece
 
@@ -348,9 +385,18 @@ class PlayerViewModel(
         val tolerance = (ticksPerQuarter / 2).toLong().coerceAtLeast(1L)
 
         val enriched = piece.notes.map { note ->
+            // A hand the user set by hand is not up for revision. Without this
+            // the score would silently overrule the choice on every load — and
+            // only for notes it happened to match, leaving the piece
+            // half-reverted, which reads as a bug rather than as a policy.
+            if (note.handPinned) return@map note
             val candidates = byPitch[note.pitch] ?: return@map note
-            val match = candidates.minByOrNull { kotlin.math.abs(it.first - note.startTick) }
-                ?.takeIf { kotlin.math.abs(it.first - note.startTick) <= tolerance }
+            // Compare on the score's own timeline. A piece that has been shifted
+            // to make room at the front would otherwise miss *every* match, and
+            // lose its hand and fingering overlay without saying anything.
+            val onset = note.startTick - offsetTicks
+            val match = candidates.minByOrNull { kotlin.math.abs(it.first - onset) }
+                ?.takeIf { kotlin.math.abs(it.first - onset) <= tolerance }
                 ?: return@map note
 
             note.copy(
@@ -411,12 +457,27 @@ class PlayerViewModel(
 
     fun updateScrub(tick: Long) {
         if (!_state.value.scrubbing) return
+        if (_state.value.editing && tick < 0L) {
+            // Free to go before the start, but only as far as there is pre-roll
+            // drawn — scrolling into unbounded blank space is just being lost.
+            editViewTick = tick.coerceAtLeast(-preRollTicks())
+            return
+        }
+        // Back inside the piece: hand the view to the ordinary playhead again.
+        editViewTick = null
         val target = tick.coerceIn(0L, piece.endTick)
         scrubTick = target
         // Hearing the notes go past is most of what makes scrubbing usable for
         // finding a passage — the highway alone tells you where you are, not
         // what it is. Silent when dragging backwards; see previewTo.
         if (previewingScrub) engine.previewTo(target)
+    }
+
+    /** How far before bar 1 the view may scroll: a few bars of room. */
+    fun preRollTicks(): Long {
+        val signature = piece.timeSignatureAt(0)
+        val perBar = signature.ticksPerBar(ticksPerQuarter).coerceAtLeast(1L)
+        return perBar * PRE_ROLL_BARS
     }
 
     fun endScrub() {
@@ -427,6 +488,13 @@ class PlayerViewModel(
             previewingScrub = false
             engine.endPreview()
         }
+        // Left out in the pre-roll: the view stays there, and the transport stays
+        // where it was. There is nothing before bar 1 to seek to yet.
+        if (editViewTick != null) {
+            scrubTick = null
+            _state.value = _state.value.copy(scrubbing = false)
+            return
+        }
         val target = scrubTick ?: return
         scrubTick = null
         _state.value = _state.value.copy(scrubbing = false)
@@ -436,6 +504,21 @@ class PlayerViewModel(
             engine.resume()
         }
     }
+
+    /**
+     * Sounds a pitch while a note is being dragged.
+     *
+     * Re-triggers rather than refusing when the pitch is already ringing, which
+     * is the opposite of what a tapped key wants — see
+     * [PlaybackEngine.restrikeKey].
+     */
+    fun auditionPitch(pitch: Int) {
+        engine.restrikeKey(pitch, handAt(pitch))
+    }
+
+    /** Which hand a pitch belongs to, from the piece's own split where there is one. */
+    private fun handAt(pitch: Int): Hand =
+        session?.handFor(pitch) ?: if (pitch < MIDDLE_C) Hand.LEFT else Hand.RIGHT
 
     /** Sounds a key tapped on the drawn keyboard. */
     fun strikeKey(pitch: Int) {
@@ -621,7 +704,13 @@ class PlayerViewModel(
      */
     private var session: EditSession? = null
 
-    private var selectedId: NoteId? = null
+    /**
+     * The selection, in the order notes were added to it.
+     *
+     * Ids rather than indices: an index is only meaningful against one version
+     * of the note list, and every edit rebuilds it.
+     */
+    private val selectedIds = LinkedHashSet<NoteId>()
 
     fun toggleEditMode() {
         if (_state.value.editing) requestLeaveEdit() else enterEditMode()
@@ -642,29 +731,22 @@ class PlayerViewModel(
         // Editing notes as they stream past is not editing, it is whack-a-mole.
         engine.pause()
 
-        val started = EditSession(piece)
-        session = started
-        // The session sorts by (start, pitch); the MusicXML path sorts by start
-        // alone, so a score-only song can come in with a chord's notes in a
-        // different order. Adopting the session's ordering up front is what keeps
-        // "the note at index 7" the same note on both sides — otherwise tapping
-        // one note of a chord would select another.
-        piece = started.toPiece()
-        viewModelScope.launch { engine.updatePiece(piece) }
-
-        selectedId = null
+        startSessionOn(piece)
+        selectedIds.clear()
         _state.value = _state.value.copy(
             editing = true,
+            selectMode = false,
             model = HighwayModel(piece),
             editBlocked = null,
             editError = null,
             editSaved = false,
-            selectedIndex = -1,
-            selectedNote = null,
+            selectedIndices = emptyList(),
+            selectedNotes = emptyList(),
             canUndo = false,
             canRedo = false,
             editDirty = false,
             hasImportedBackup = repository.hasImportedBackup(song),
+            startOffsetTicks = song.startOffsetTicks,
         )
     }
 
@@ -688,13 +770,17 @@ class PlayerViewModel(
     }
 
     private fun leaveEditMode() {
+        editViewTick = null
         session = null
-        selectedId = null
+        selectedIds.clear()
         _state.value = _state.value.copy(
             editing = false,
             confirmLeavingEdit = false,
-            selectedIndex = -1,
-            selectedNote = null,
+            // The lasso is a mode, and a mode left on across sessions is one you
+            // will be surprised by next time rather than helped by.
+            selectMode = false,
+            selectedIndices = emptyList(),
+            selectedNotes = emptyList(),
             canUndo = false,
             canRedo = false,
             editDirty = false,
@@ -710,16 +796,66 @@ class PlayerViewModel(
 
     val ticksPerQuarter: Int get() = piece.tempoMap.ticksPerQuarter
 
+    /**
+     * Handles a tap on the note at [index], or on empty space when it is -1.
+     *
+     * In select mode a tap toggles membership, so a passage can be built up note
+     * by note; otherwise it replaces the selection, which is what you want when
+     * you are working on one note at a time.
+     */
     fun select(index: Int) {
         val current = session ?: return
         val id = if (index >= 0) current.notes.idAt(index) else null
-        selectedId = id
-        val note = id?.let { current[it] }
+
+        if (id == null) {
+            selectedIds.clear()
+        } else if (_state.value.selectMode) {
+            if (!selectedIds.remove(id)) selectedIds += id
+        } else {
+            selectedIds.clear()
+            selectedIds += id
+        }
+
+        publishSelection()
+        // Only audition a note being added, never one being taken away.
+        if (id != null && id in selectedIds) {
+            current[id]?.let { engine.strikeKey(it.pitch, it.hand) }
+        }
+    }
+
+    /** Selects everything the marquee touched, replacing or extending as the mode says. */
+    fun selectRange(indices: List<Int>) {
+        val current = session ?: return
+        if (!_state.value.selectMode) selectedIds.clear()
+        indices.forEach { index -> current.notes.idAt(index)?.let { selectedIds += it } }
+        publishSelection()
+    }
+
+    fun setSelectMode(on: Boolean) {
+        _state.value = _state.value.copy(selectMode = on)
+    }
+
+    fun clearSelection() {
+        if (selectedIds.isEmpty()) return
+        selectedIds.clear()
+        publishSelection()
+    }
+
+    /** Recomputes the indices and notes the UI reads, from the ids that are the truth. */
+    private fun publishSelection() {
+        val current = session
+        if (current == null) {
+            _state.value = _state.value.copy(selectedIndices = emptyList(), selectedNotes = emptyList())
+            return
+        }
+        // Drop ids whose notes have since gone, so a stale selection can never
+        // leave a control enabled that would then silently do nothing.
+        selectedIds.retainAll { current[it] != null }
+        val indices = selectedIds.map { current.notes.indexOf(it) }.filter { it >= 0 }.sorted()
         _state.value = _state.value.copy(
-            selectedIndex = if (note == null) -1 else index,
-            selectedNote = note,
+            selectedIndices = indices,
+            selectedNotes = indices.mapNotNull { current.notes.noteAtIndex(it) },
         )
-        note?.let { engine.strikeKey(it.pitch, it.hand) }
     }
 
     /** A new note takes the loudness and the hand the rest of the piece implies. */
@@ -736,18 +872,63 @@ class PlayerViewModel(
         applyEdit(EditCommand.Replace(id, draft.toNote(minLengthTicks)))
     }
 
+    /** Commits a drag that moved the whole selection by one offset. */
+    fun commitGroupDrag(deltaTicks: Long, deltaPitch: Int) {
+        if (deltaTicks == 0L && deltaPitch == 0) return
+        nudgeSelected { draft ->
+            draft.copy(
+                pitch = draft.pitch + deltaPitch,
+                startTick = draft.startTick + deltaTicks,
+                endTick = draft.endTick + deltaTicks,
+            )
+        }
+    }
+
     fun insertNote(draft: NoteDraft, minLengthTicks: Long) {
+        val current = session ?: return
+        // A note dropped in the pre-roll is what turns that empty space into
+        // real bars: the piece shifts later so the note lands at or after zero,
+        // and the shift and the insert undo together as one step.
+        if (draft.startTick < 0L) {
+            val perBar = piece.timeSignatureAt(0)
+                .ticksPerBar(ticksPerQuarter)
+                .coerceAtLeast(1L)
+            val bars = (-draft.startTick + perBar - 1) / perBar
+            val shift = bars * perBar
+            val moved = draft.copy(
+                startTick = draft.startTick + shift,
+                endTick = draft.endTick + shift,
+            )
+            applyEdit(
+                EditCommand.Batch(
+                    listOf(
+                        EditCommand.Rebase(shift),
+                        EditCommand.Insert(moved.toNote(minLengthTicks)),
+                    ),
+                ),
+            )
+            // The view was looking at empty space that is now bar 1.
+            editViewTick = null
+            _state.value = _state.value.copy(startOffsetTicks = current.offsetTicks)
+            return
+        }
         applyEdit(EditCommand.Insert(draft.toNote(minLengthTicks)))
     }
 
     fun deleteSelected() {
-        val id = selectedId ?: return
-        applyEdit(EditCommand.Delete(id), keepSelection = false)
+        if (selectedIds.isEmpty()) return
+        applyEdit(
+            EditCommand.Batch(selectedIds.map { EditCommand.Delete(it) }),
+            keepSelection = false,
+        )
     }
 
     fun nudgePitch(semitones: Int) = nudgeSelected { draft ->
         draft.copy(pitch = draft.pitch + semitones)
     }
+
+    /** Moves the selection a whole octave, the interval worth its own button. */
+    fun transposeOctaves(octaves: Int) = nudgePitch(octaves * 12)
 
     fun nudgeStart(steps: Int) = nudgeSelected { draft ->
         val step = gridStep()
@@ -761,35 +942,85 @@ class PlayerViewModel(
         draft.copy(endTick = draft.endTick + steps * gridStep())
     }
 
+    /** Puts every selected note on [hand], and pins it against the sheet music. */
+    fun setSelectedHand(hand: Hand) = nudgeSelected { draft ->
+        draft.copy(hand = hand, handPinned = true)
+    }
+
     private fun gridStep(): Long {
         val grid = _state.value.snapGrid
         return if (grid.isFree) 1L else grid.unitTicks(ticksPerQuarter)
     }
 
+    /**
+     * Applies [transform] to every selected note as a single undoable step.
+     *
+     * One press of Undo has to take back one press of a button, however many
+     * notes that button moved — hence the batch rather than a loop of commands.
+     */
     private fun nudgeSelected(transform: (NoteDraft) -> NoteDraft) {
         val current = session ?: return
-        val id = selectedId ?: return
-        val note = current[id] ?: return
+        if (selectedIds.isEmpty()) return
         val minLength = if (_state.value.snapGrid.isFree) 1L else gridStep()
-        applyEdit(EditCommand.Replace(id, transform(NoteDraft.of(note)).toNote(minLength)))
+        val commands = selectedIds.mapNotNull { id ->
+            current[id]?.let { note ->
+                EditCommand.Replace(id, transform(NoteDraft.of(note)).toNote(minLength))
+            }
+        }
+        if (commands.isEmpty()) return
+        applyEdit(EditCommand.Batch(commands))
     }
 
     fun undo() {
-        val id = session?.undo() ?: return
-        selectedId = id
+        val ids = session?.undo().orEmpty()
+        if (ids.isEmpty()) return
+        selectedIds.clear()
+        selectedIds += ids
         afterEdit()
     }
 
     fun redo() {
-        val id = session?.redo() ?: return
-        selectedId = id
+        val ids = session?.redo().orEmpty()
+        if (ids.isEmpty()) return
+        selectedIds.clear()
+        selectedIds += ids
         afterEdit()
+    }
+
+    /**
+     * Starts an editing session over [loaded] and adopts its note ordering.
+     *
+     * Adopting matters, and forgetting it is a silent bug rather than a loud one.
+     * [EditNotes] sorts by `(startTick, pitch)`; the MusicXML path sorts by start
+     * tick alone, so a score-derived song can arrive with a chord's notes in a
+     * different order from the session's. The highway hit-tests against
+     * `model.notes` and the session resolves that index against its own list, so
+     * a disagreement means tapping one note of a chord selects a different one —
+     * and deleting it then removes something off-screen, which looks exactly like
+     * nothing happening. Every path that builds a session goes through here.
+     */
+    private fun startSessionOn(loaded: Piece) {
+        val started = EditSession(loaded)
+        session = started
+        piece = started.toPiece()
+        viewModelScope.launch { engine.updatePiece(piece) }
     }
 
     private fun applyEdit(command: EditCommand, keepSelection: Boolean = true) {
         val current = session ?: return
-        val id = current.apply(command) ?: return
-        selectedId = if (keepSelection) id else null
+        val ids = current.apply(command)
+        if (ids.isEmpty()) {
+            // The command named notes that are no longer there. Saying nothing
+            // makes a live control look dead, which is how this surfaced the
+            // first time; drop the stale selection so the button at least
+            // disables itself.
+            Log.w(TAG, "edit skipped: ${command::class.simpleName} referred to missing notes")
+            selectedIds.clear()
+            afterEdit()
+            return
+        }
+        selectedIds.clear()
+        if (keepSelection) selectedIds += ids
         afterEdit()
     }
 
@@ -803,19 +1034,16 @@ class PlayerViewModel(
     private fun afterEdit() {
         val current = session ?: return
         piece = current.toPiece()
-        val note = selectedId?.let { current[it] }
-        val index = selectedId?.let { current.notes.indexOf(it) } ?: -1
 
         _state.value = _state.value.copy(
             model = HighwayModel(piece),
-            selectedIndex = if (note == null) -1 else index,
-            selectedNote = note,
             canUndo = current.canUndo,
             canRedo = current.canRedo,
             editDirty = current.isDirty,
             editSaved = false,
             editError = null,
         )
+        publishSelection()
 
         viewModelScope.launch { engine.updatePiece(piece) }
     }
@@ -824,21 +1052,24 @@ class PlayerViewModel(
         val song = _state.value.song ?: return
         val current = session ?: return
         viewModelScope.launch {
-            repository.saveEditedPiece(song, current.toPiece())
+            repository.saveEditedPiece(
+                song.copy(startOffsetTicks = song.startOffsetTicks + current.offsetTicks),
+                current.toPiece(),
+            )
                 .onSuccess { saved ->
                     // A fresh session over the saved piece: the file on disk is
                     // now the baseline, so "unsaved changes" must start empty
                     // again and undo must not step back across the save.
                     session = EditSession(piece)
-                    selectedId = null
+                    selectedIds.clear()
                     _state.value = _state.value.copy(
                         song = saved,
                         hasScore = saved.scoreFileName != null,
                         editDirty = false,
                         canUndo = false,
                         canRedo = false,
-                        selectedIndex = -1,
-                        selectedNote = null,
+                        selectedIndices = emptyList(),
+                        selectedNotes = emptyList(),
                         hasImportedBackup = repository.hasImportedBackup(saved),
                         editSaved = true,
                         editError = null,
@@ -859,7 +1090,11 @@ class PlayerViewModel(
             repository.loadPiece(song)
                 .onSuccess { loaded ->
                     val score = repository.loadScore(song)
-                    piece = if (score != null) enrichWithScore(loaded, score) else loaded
+                    piece = if (score != null) {
+                        enrichWithScore(loaded, score, song.startOffsetTicks)
+                    } else {
+                        loaded
+                    }
                     engine.updatePiece(piece)
                     _state.value = _state.value.copy(model = HighwayModel(piece))
                     leaveEditMode()
@@ -876,15 +1111,13 @@ class PlayerViewModel(
                 .onSuccess { restored ->
                     val loaded = repository.loadPiece(restored).getOrNull() ?: return@onSuccess
                     val score = repository.loadScore(restored)
-                    piece = if (score != null) enrichWithScore(loaded, score) else loaded
-                    engine.updatePiece(piece)
-                    session = EditSession(piece)
-                    selectedId = null
+                    startSessionOn(if (score != null) enrichWithScore(loaded, score, restored.startOffsetTicks) else loaded)
+                    selectedIds.clear()
                     _state.value = _state.value.copy(
                         song = restored,
                         model = HighwayModel(piece),
-                        selectedIndex = -1,
-                        selectedNote = null,
+                        selectedIndices = emptyList(),
+                        selectedNotes = emptyList(),
                         canUndo = false,
                         canRedo = false,
                         editDirty = false,
@@ -913,7 +1146,10 @@ class PlayerViewModel(
         val current = session ?: return
         _state.value = _state.value.copy(confirmLeavingEdit = false)
         viewModelScope.launch {
-            repository.saveEditedPiece(song, current.toPiece())
+            repository.saveEditedPiece(
+                song.copy(startOffsetTicks = song.startOffsetTicks + current.offsetTicks),
+                current.toPiece(),
+            )
                 .onSuccess { saved ->
                     _state.value = _state.value.copy(song = saved, editSaved = true)
                     leaveEditMode()
@@ -961,6 +1197,15 @@ class PlayerViewModel(
         /** Where a tapped key is assumed to change hands, for colour and channel. */
         private const val MIDDLE_C = 60
         private const val RANGE_POLL_MS = 300L
+
+        /**
+         * Bars of empty space the view may scroll into before bar 1.
+         *
+         * Enough to write a pickup or a couple of introductory bars into; the
+         * limit exists so that scrolling up does not run on forever into blank
+         * space with no way to tell how far you have gone.
+         */
+        private const val PRE_ROLL_BARS = 4L
 
         fun factory(songId: String) = object : ViewModelProvider.Factory {
             @Suppress("UNCHECKED_CAST")

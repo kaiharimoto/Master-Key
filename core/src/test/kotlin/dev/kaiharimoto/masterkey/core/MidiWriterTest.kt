@@ -49,7 +49,7 @@ class MidiWriterTest {
 
     private fun roundTrip(piece: Piece): Piece = MidiLoader.load(MidiWriter.write(piece))
 
-    private fun Note.core() = listOf(pitch, startTick, endTick, velocity, hand)
+    private fun Note.core() = listOf(pitch, startTick, endTick, velocity, hand, handPinned)
 
     @Test
     fun `a single note survives the round trip`() {
@@ -253,6 +253,89 @@ class MidiWriterTest {
 
         assertThat(reloaded.notes).hasSize(1)
         assertThat(reloaded.notes.first().velocity).isEqualTo(1)
+    }
+
+    @Test
+    fun `a hand set by the user survives the round trip`() {
+        // Hands are not stored in a MIDI file — they are inferred from the track
+        // split — so a note deliberately put on the "wrong" side of the split has
+        // nothing to hold it there but the pin.
+        val piece = pieceOf(
+            listOf(
+                note(72, 0, 480, Hand.RIGHT),
+                note(76, 480, 960, Hand.RIGHT),
+                // A high note the user has insisted belongs to the left hand.
+                note(79, 960, 1440, Hand.LEFT).copy(handPinned = true),
+                note(48, 0, 960, Hand.LEFT),
+                note(43, 960, 1440, Hand.LEFT),
+            ),
+        )
+
+        val reloaded = roundTrip(piece)
+
+        val high = reloaded.notes.first { it.pitch == 79 }
+        assertThat(high.hand).isEqualTo(Hand.LEFT)
+        assertThat(high.handPinned).isTrue()
+        assertThat(reloaded.notes.first { it.pitch == 72 }.handPinned).isFalse()
+    }
+
+    @Test
+    fun `a pin list longer than a single length byte is not truncated`() {
+        // A meta event's length is a variable-length quantity. Written as one
+        // byte it would wrap at 128 and corrupt every event after it, and 26
+        // pinned notes is already past that.
+        val notes = (0 until 60).map { i ->
+            val hand = if (i % 2 == 0) Hand.RIGHT else Hand.LEFT
+            val pitch = if (hand == Hand.RIGHT) 60 + i % 18 else 40 + i % 12
+            note(pitch, i * 240L, i * 240L + 240, hand).copy(handPinned = true)
+        }
+        val piece = pieceOf(notes)
+
+        val reloaded = roundTrip(piece)
+
+        assertThat(reloaded.notes.count { it.handPinned }).isEqualTo(60)
+        assertThat(reloaded.notes.map { it.core() })
+            .containsExactlyElementsIn(piece.notes.map { it.core() })
+            .inOrder()
+    }
+
+    @Test
+    fun `a file with no pin marker loads with nothing pinned`() {
+        val bytes = TestSmf()
+            .track { tempo(0, 500_000) }
+            .track {
+                noteOn(0, channel = 0, pitch = 72)
+                noteOff(480, channel = 0, pitch = 72)
+            }
+            .build()
+
+        val piece = MidiLoader.load(bytes)
+
+        assertThat(piece.notes.none { it.handPinned }).isTrue()
+    }
+
+    @Test
+    fun `reassigned hands are not swapped wholesale on reload`() {
+        // assignByGroup labels the two tracks by mean pitch. Move enough notes
+        // across and the left-hand track's mean overtakes the right's, which
+        // used to flip *both* labels and undo far more than was asked.
+        val piece = pieceOf(
+            listOf(
+                note(84, 0, 480, Hand.LEFT).copy(handPinned = true),
+                note(86, 480, 960, Hand.LEFT).copy(handPinned = true),
+                note(88, 960, 1440, Hand.LEFT).copy(handPinned = true),
+                note(40, 0, 480, Hand.RIGHT).copy(handPinned = true),
+                note(42, 480, 960, Hand.RIGHT).copy(handPinned = true),
+            ),
+        )
+
+        val reloaded = roundTrip(piece)
+
+        val byPitch = reloaded.notes.associateBy { it.pitch }
+        assertThat(byPitch.getValue(84).hand).isEqualTo(Hand.LEFT)
+        assertThat(byPitch.getValue(88).hand).isEqualTo(Hand.LEFT)
+        assertThat(byPitch.getValue(40).hand).isEqualTo(Hand.RIGHT)
+        assertThat(byPitch.getValue(42).hand).isEqualTo(Hand.RIGHT)
     }
 
     @Test

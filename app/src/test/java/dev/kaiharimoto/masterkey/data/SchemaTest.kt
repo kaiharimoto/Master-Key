@@ -98,6 +98,26 @@ class SchemaTest {
     }
 
     @Test
+    fun `every version between the first and the current has a migration`() {
+        // Room only runs migrations it can chain. A gap means an upgrade from
+        // that version takes the destructive path — or, worse, fails its identity
+        // check at the first query, which happens at startup.
+        val (fileVersion, _) = latestSchema()
+        val covered = MIGRATIONS.map { it.startVersion to it.endVersion }.toSet()
+
+        for (from in 1 until fileVersion) {
+            assertThat(covered).contains(from to from + 1)
+        }
+    }
+
+    @Test
+    fun `startOffsetTicks is present, since the pre-roll depends on it persisting`() {
+        val (_, schema) = latestSchema()
+
+        assertThat(columnsOf(schema, "songs")).contains("startOffsetTicks")
+    }
+
+    @Test
     fun `practice tables match their entities`() {
         val (_, schema) = latestSchema()
 

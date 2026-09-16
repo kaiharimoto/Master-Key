@@ -42,6 +42,11 @@ object MidiLoader {
     private const val STATUS_NOTE_ON = 0x90
     private const val META_STATUS = 0xFF
     private const val PERCUSSION_CHANNEL = 9
+    private const val META_SEQUENCER_SPECIFIC = 0x7F
+
+    /** See `MidiWriter.MASTER_KEY_ID`: 0x7D is the non-commercial block. */
+    private val MASTER_KEY_ID = byteArrayOf(0x7D, 0x4D, 0x4B)
+    private const val TAG_PINNED_HANDS = 0x01
 
     fun load(bytes: ByteArray): Piece {
         val music = Midi1Music()
@@ -62,6 +67,8 @@ object MidiLoader {
         val isSmpte = division < 0 || (division and 0x8000) != 0
 
         val rawNotes = mutableListOf<RawNote>()
+        /** `(startTick, pitch)` of notes whose hand was chosen by the user. */
+        val pinnedHands = HashSet<Long>()
         val tempoChanges = mutableListOf<Pair<Long, Int>>()
         val timeSignatures = mutableListOf<TimeSignature>()
         val keySignatures = mutableListOf<KeySignature>()
@@ -113,6 +120,13 @@ object MidiLoader {
                             }
 
                             MidiMetaType.END_OF_TRACK -> endTick = maxOf(endTick, tick)
+
+                            // Our own marker for hands the user set rather than
+                            // the app guessing. Anything with a different
+                            // manufacturer id is somebody else's business.
+                            META_SEQUENCER_SPECIFIC -> if (data != null) {
+                                readPinnedHands(data, offset, length, pinnedHands)
+                            }
                         }
                     }
 
@@ -166,7 +180,14 @@ object MidiLoader {
             TempoMap.build(ticksPerQuarter.coerceAtLeast(1), tempoChanges)
         }
 
-        val notes = HandAssigner.assign(rawNotes)
+        val notes = HandAssigner.assign(rawNotes, trustTracks = pinnedHands.isNotEmpty())
+            .map { note ->
+                if (pinnedKey(note.startTick, note.pitch) in pinnedHands) {
+                    note.copy(handPinned = true)
+                } else {
+                    note
+                }
+            }
             .sortedWith(compareBy({ it.startTick }, { it.pitch }))
 
         return Piece(
@@ -180,6 +201,36 @@ object MidiLoader {
     }
 
     private fun key(channel: Int, pitch: Int) = (channel shl 8) or pitch
+
+    /** Packs a note's position and pitch into one comparable key. */
+    private fun pinnedKey(startTick: Long, pitch: Int): Long = (startTick shl 8) or pitch.toLong()
+
+    /**
+     * Reads our pinned-hand marker, ignoring anyone else's sequencer-specific data.
+     *
+     * Deliberately forgiving: a truncated or unfamiliar payload leaves the set
+     * alone rather than throwing, because losing a hand annotation should never
+     * cost someone their song.
+     */
+    private fun readPinnedHands(data: ByteArray, offset: Int, length: Int, into: MutableSet<Long>) {
+        if (length < MASTER_KEY_ID.size + 1) return
+        for (i in MASTER_KEY_ID.indices) {
+            if (data[offset + i] != MASTER_KEY_ID[i]) return
+        }
+        if ((data[offset + MASTER_KEY_ID.size].toInt() and 0xFF) != TAG_PINNED_HANDS) return
+
+        var at = offset + MASTER_KEY_ID.size + 1
+        val end = offset + length
+        while (at + 5 <= end) {
+            val tick = ((data[at].toLong() and 0xFF) shl 24) or
+                ((data[at + 1].toLong() and 0xFF) shl 16) or
+                ((data[at + 2].toLong() and 0xFF) shl 8) or
+                (data[at + 3].toLong() and 0xFF)
+            val pitch = data[at + 4].toInt() and 0x7F
+            into += pinnedKey(tick, pitch)
+            at += 5
+        }
+    }
 
     private fun closeNote(
         pending: MutableMap<Int, ArrayDeque<Pair<Long, Int>>>,

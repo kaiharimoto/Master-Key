@@ -136,6 +136,47 @@ object HighwayHitTest {
     }
 
     /**
+     * Every note whose drawn rectangle overlaps the given box.
+     *
+     * Overlap, not containment: sweeping a marquee across the middle of a run of
+     * long notes should catch them, and requiring a note to be wholly inside
+     * would mean missing everything held longer than the sweep.
+     */
+    fun notesIn(
+        model: HighwayModel,
+        layout: HighwayLayout,
+        left: Float,
+        top: Float,
+        right: Float,
+        bottom: Float,
+        playheadTick: Long,
+        keyLineY: Float,
+        pixelsPerTick: Float,
+    ): List<Int> {
+        if (pixelsPerTick <= 0f) return emptyList()
+        // The box spans these ticks; walk only the notes that could reach them.
+        val fromTick = tickAt(bottom, playheadTick, keyLineY, pixelsPerTick)
+        val toTick = tickAt(top, playheadTick, keyLineY, pixelsPerTick)
+
+        val hits = ArrayList<Int>()
+        val notes = model.notes
+        var index = model.firstVisibleIndex(fromTick)
+        while (index < notes.size) {
+            val note = notes[index]
+            if (note.startTick > toTick) break
+            val here = index
+            index++
+
+            if (note.endTick < fromTick) continue
+            val noteLeft = layout.leftOf(note.pitch)
+            val noteRight = noteLeft + layout.widthOf(note.pitch)
+            if (noteRight < left || noteLeft > right) continue
+            hits += here
+        }
+        return hits
+    }
+
+    /**
      * Which grip [y] is on, for a note drawn between [topY] and [bottomY].
      *
      * A note has three zones only while it is tall enough for each to be aimable.

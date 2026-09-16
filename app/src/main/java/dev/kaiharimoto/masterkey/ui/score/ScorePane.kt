@@ -73,6 +73,13 @@ fun ScorePane(
     zoom: Int = 70,
     /** Why there is nothing to engrave, when the file could not be read at all. */
     loadError: String? = null,
+    /**
+     * Ticks the played piece has been shifted relative to the engraved score.
+     *
+     * Making room before bar 1 moves the MIDI later; the MusicXML cannot follow,
+     * so the cursor subtracts the shift and goes on pointing at the right bar.
+     */
+    offsetTicks: Long = 0,
     onEvent: (ScoreEvent) -> Unit = {},
 ) {
     val context = LocalContext.current
@@ -211,12 +218,12 @@ fun ScorePane(
 
     // Cursor updates. Musical position in quarter notes, so it needs no tempo
     // conversion on the JS side and stays correct at any playback speed.
-    LaunchedEffect(bridge, piece) {
+    LaunchedEffect(bridge, piece, offsetTicks) {
         bridge.awaitLoaded()
         val ticksPerQuarter = piece.tempoMap.ticksPerQuarter.toDouble().coerceAtLeast(1.0)
         var lastQuarter = -1.0
         while (coroutineContext.isActive) {
-            val quarters = positionProvider() / ticksPerQuarter
+            val quarters = (positionProvider() - offsetTicks) / ticksPerQuarter
             if (kotlin.math.abs(quarters - lastQuarter) > 0.01) {
                 lastQuarter = quarters
                 webView.evaluateJavascript(

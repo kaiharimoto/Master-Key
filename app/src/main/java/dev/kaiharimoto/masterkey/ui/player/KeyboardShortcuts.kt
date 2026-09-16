@@ -109,11 +109,11 @@ val SHORTCUT_GROUPS: List<Pair<String, List<Shortcut>>> = listOf(
     // note rather than to the transport.
     "Editing" to listOf(
         Shortcut("E", "Enter / leave edit mode"),
-        Shortcut("↑ ↓", "Move the note a semitone"),
-        Shortcut("⇧ ↑ ↓", "Move it an octave"),
+        Shortcut("↑ ↓", "Move the selection a semitone"),
+        Shortcut("⇧ ↑ ↓", "Transpose it an octave"),
         Shortcut("← →", "Move it one grid step earlier / later"),
         Shortcut("⇧ ← →", "Make it one step shorter / longer"),
-        Shortcut("Del", "Delete the selected note"),
+        Shortcut("Del", "Delete the selection"),
         Shortcut("Z", "Undo"),
         Shortcut("⇧ Z", "Redo"),
     ),

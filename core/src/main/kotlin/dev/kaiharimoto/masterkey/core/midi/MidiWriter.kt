@@ -48,6 +48,21 @@ object MidiWriter {
     private const val META_KEY_SIGNATURE = 0x59
     private const val META_TEMPO = 0x51
     private const val META_END_OF_TRACK = 0x2F
+    private const val META_SEQUENCER_SPECIFIC = 0x7F
+
+    /**
+     * Our own three-byte manufacturer id for sequencer-specific meta events.
+     *
+     * 0x7D is the block the MIDI Manufacturers Association reserves for
+     * non-commercial and educational use, which is exactly what this is. A reader
+     * that does not know the id — including every other program — skips the whole
+     * event, and [MidiLoader]'s own meta handling has no `else` branch, so an
+     * older build of this app reads a newer file with no idea it was there.
+     */
+    private val MASTER_KEY_ID = byteArrayOf(0x7D, 0x4D, 0x4B)
+
+    /** Payload tag: the notes whose hand the user set rather than the app guessing. */
+    private const val TAG_PINNED_HANDS = 0x01
 
     /** The largest delta a variable-length quantity can carry: four 7-bit bytes. */
     private const val MAX_DELTA = 0x0FFF_FFFFL
@@ -156,6 +171,12 @@ object MidiWriter {
             )
         }
 
+        // Which notes had their hand chosen by hand. Hands are not a MIDI concept
+        // — they are inferred on load from the track split — so without this the
+        // user's choice would be re-guessed, and overruled outright wherever a
+        // MusicXML is linked.
+        pinnedHandsEvent(piece)?.let { events += AbsoluteEvent(0L, RANK_META, it) }
+
         // End of track carries the piece's length, which is not always the end of
         // the last note — a piece can finish with a rest, and losing that would
         // shorten the scrubber every time the song was saved.
@@ -209,11 +230,40 @@ object MidiWriter {
         return out.toByteArray()
     }
 
+    /**
+     * Encodes the pinned notes as `(tick, pitch)` pairs.
+     *
+     * Keyed on position and pitch rather than on any identity, which is the same
+     * key the MusicXML overlay matches on — so the pin and the thing it defends
+     * against drift together rather than disagreeing.
+     */
+    private fun pinnedHandsEvent(piece: Piece): ByteArray? {
+        val pinned = piece.notes.filter { it.handPinned }
+        if (pinned.isEmpty()) return null
+
+        val payload = ByteArrayOutputStream()
+        payload.write(MASTER_KEY_ID)
+        payload.write(TAG_PINNED_HANDS)
+        for (note in pinned) {
+            val tick = note.startTick
+            payload.write(((tick shr 24) and 0xFF).toInt())
+            payload.write(((tick shr 16) and 0xFF).toInt())
+            payload.write(((tick shr 8) and 0xFF).toInt())
+            payload.write((tick and 0xFF).toInt())
+            payload.write(note.pitch and 0x7F)
+        }
+        return meta(META_SEQUENCER_SPECIFIC, payload.toByteArray())
+    }
+
     private fun meta(type: Int, data: ByteArray): ByteArray {
         val out = ByteArrayOutputStream()
         out.write(META_STATUS)
         out.write(type)
-        out.write(data.size)
+        // A meta event's length is a variable-length quantity, not a byte. The
+        // fixed-size events here never reach 128, but the pinned-hand list does
+        // as soon as there are 25 of them, and writing its length as one byte
+        // would truncate the event and corrupt everything after it.
+        writeVarLen(out, data.size.toLong())
         out.write(data)
         return out.toByteArray()
     }

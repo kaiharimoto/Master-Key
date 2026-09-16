@@ -86,9 +86,33 @@ val MIGRATION_1_2 = object : Migration(1, 2) {
     }
 }
 
+/**
+ * Adds `startOffsetTicks`, for space inserted before the start of a piece.
+ *
+ * Nullable-free with a default, so an existing row needs no backfill: every song
+ * imported before this feature existed has never been shifted, which is exactly
+ * what 0 means.
+ */
+val MIGRATION_2_3 = object : Migration(2, 3) {
+    override fun migrate(connection: SQLiteConnection) {
+        connection.execSQL(
+            "ALTER TABLE songs ADD COLUMN startOffsetTicks INTEGER NOT NULL DEFAULT 0",
+        )
+    }
+}
+
+/**
+ * Every migration, in one place so the chain can be checked rather than assumed.
+ *
+ * A gap here means an upgrade from that version silently takes the destructive
+ * path, or fails Room's identity check at the first query — which happens at
+ * startup, behind the in-app updater. `SchemaTest` walks this list.
+ */
+val MIGRATIONS = arrayOf(MIGRATION_1_2, MIGRATION_2_3)
+
 @Database(
     entities = [SongEntity::class, PracticeSectionEntity::class, PracticeSessionEntity::class],
-    version = 2,
+    version = 3,
     // Exported schemas are committed under app/schemas and checked in CI, so a
     // schema change without a version bump fails the build instead of the app.
     exportSchema = true,
@@ -107,7 +131,7 @@ abstract class MasterKeyDatabase : RoomDatabase() {
                 MasterKeyDatabase::class.java,
                 NAME,
             )
-                .addMigrations(MIGRATION_1_2)
+                .addMigrations(*MIGRATIONS)
                 // Installing an older APK should degrade, not brick. The library
                 // is rebuildable from the files on disk, so dropping the index is
                 // recoverable rather than destructive.

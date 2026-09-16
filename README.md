@@ -42,11 +42,21 @@ evidence actually supports.
 missing ties and passages nobody would play that way. Edit mode lets you fix
 them on the falling notes themselves: tap a note to select and hear it, drag its
 body to move it in time and pitch, drag either end to lengthen or shorten it,
-press and hold an empty lane to add one. A snap grid from 1/4 down to 1/32 —
+press and hold an empty lane to add one. Every drag sounds as it lands, so you
+hear the fix rather than only seeing it. A snap grid from 1/4 down to 1/32 —
 triplets included, or off entirely — decides how a note lands, pinch zooms the
 timeline in until a 1/32 is a comfortable target, and the nudge buttons move the
 selection by exactly one step or one semitone when a fingertip is not precise
 enough. Undo and redo throughout.
+
+Turn on **Select** and a drag across empty space sweeps up everything it
+touches, so a whole passage can be moved, transposed an octave, reassigned to
+the other hand or deleted in one go — and taken back with one press of Undo. A
+hand you set by hand stays set, even on a song whose sheet music says otherwise.
+
+The piece does not have to start where it starts: scroll up past bar 1 into the
+empty space in front of it and drop a note there, and the music shifts back to
+make room for the pickup or the introduction you wanted.
 
 Saving rewrites the song's MIDI, so playback, the highway and the library all
 agree about what the notes are. The file you imported is kept, and **Revert**

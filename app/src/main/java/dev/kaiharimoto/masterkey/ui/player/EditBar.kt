@@ -1,6 +1,7 @@
 package dev.kaiharimoto.masterkey.ui.player
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -9,6 +10,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -21,20 +23,24 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Remove
+import androidx.compose.material.icons.filled.SelectAll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -67,40 +73,68 @@ fun EditBar(
             .padding(horizontal = 10.dp, vertical = 6.dp),
         verticalArrangement = Arrangement.spacedBy(4.dp),
     ) {
+        // Only the grid chips scroll. Undo, Redo and Delete are pinned on the
+        // right: they were previously last in one long scrolling row, after seven
+        // chips, so on a narrower screen the controls you reach for most started
+        // off the edge entirely.
         Row(
-            Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+            Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(6.dp),
         ) {
-            Text(
-                "SNAP",
-                style = MaterialTheme.typography.labelSmall,
-                color = Color(0xFF6B7385),
-                letterSpacing = 1.sp,
-            )
-            SnapGrid.entries.forEach { grid ->
-                FilterChip(
-                    selected = state.snapGrid == grid,
-                    onClick = { viewModel.setSnapGrid(grid) },
-                    label = { Text(grid.label, fontSize = 12.sp) },
-                    colors = FilterChipDefaults.filterChipColors(
-                        selectedContainerColor = HandColors.amber,
-                        selectedLabelColor = Color(0xFF241800),
-                        containerColor = Color(0xFF1E222B),
-                        labelColor = Color(0xFFB6BDCA),
-                    ),
-                    modifier = Modifier.height(32.dp),
+            Row(
+                Modifier.weight(1f).horizontalScroll(rememberScrollState()),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                Text(
+                    "SNAP",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = Color(0xFF6B7385),
+                    letterSpacing = 1.sp,
                 )
+                SnapGrid.entries.forEach { grid ->
+                    FilterChip(
+                        selected = state.snapGrid == grid,
+                        onClick = { viewModel.setSnapGrid(grid) },
+                        label = { Text(grid.label, fontSize = 12.sp) },
+                        colors = FilterChipDefaults.filterChipColors(
+                            selectedContainerColor = HandColors.amber,
+                            selectedLabelColor = Color(0xFF241800),
+                            containerColor = Color(0xFF1E222B),
+                            labelColor = Color(0xFFB6BDCA),
+                        ),
+                        modifier = Modifier.height(TOOL_BUTTON_HEIGHT),
+                    )
+                }
             }
 
-            Spacer(Modifier.width(4.dp))
+            // The lasso. Its own chip rather than a hidden gesture, because with
+            // it on a one-finger drag over empty space sweeps a selection
+            // instead of scrolling — a change you want to be able to see.
+            FilterChip(
+                selected = state.selectMode,
+                onClick = { viewModel.setSelectMode(!state.selectMode) },
+                label = { Text("Select", fontSize = 12.sp) },
+                leadingIcon = {
+                    Icon(Icons.Default.SelectAll, contentDescription = null, Modifier.size(16.dp))
+                },
+                colors = FilterChipDefaults.filterChipColors(
+                    selectedContainerColor = HandColors.amber,
+                    selectedLabelColor = Color(0xFF241800),
+                    selectedLeadingIconColor = Color(0xFF241800),
+                    containerColor = Color(0xFF1E222B),
+                    labelColor = Color(0xFFB6BDCA),
+                ),
+                modifier = Modifier.height(TOOL_BUTTON_HEIGHT),
+            )
 
             ToolButton(
                 label = "Undo",
                 enabled = state.canUndo,
                 onClick = viewModel::undo,
             ) {
-                Icon(Icons.AutoMirrored.Filled.Undo, contentDescription = "Undo", Modifier.size(18.dp))
+                Icon(Icons.AutoMirrored.Filled.Undo, contentDescription = null, Modifier.size(18.dp))
             }
 
             ToolButton(
@@ -108,14 +142,14 @@ fun EditBar(
                 enabled = state.canRedo,
                 onClick = viewModel::redo,
             ) {
-                Icon(Icons.AutoMirrored.Filled.Redo, contentDescription = "Redo", Modifier.size(18.dp))
+                Icon(Icons.AutoMirrored.Filled.Redo, contentDescription = null, Modifier.size(18.dp))
             }
 
             ToolButton(
                 label = "Delete",
-                enabled = state.selectedNote != null,
+                enabled = state.hasSelection,
                 onClick = viewModel::deleteSelected,
-            ) { Icon(Icons.Default.Delete, contentDescription = "Delete note", Modifier.size(18.dp)) }
+            ) { Icon(Icons.Default.Delete, contentDescription = null, Modifier.size(18.dp)) }
         }
 
         Row(
@@ -209,10 +243,13 @@ private fun NoteInspector(
     viewModel: PlayerViewModel,
     modifier: Modifier = Modifier,
 ) {
-    val note = state.selectedNote
-    if (note == null) {
+    if (!state.hasSelection) {
         Text(
-            "Tap a note to select it. Press and hold an empty lane to add one.",
+            if (state.selectMode) {
+                "Drag across the notes you want, or tap them one by one."
+            } else {
+                "Tap a note to select it. Press and hold an empty lane to add one."
+            },
             style = MaterialTheme.typography.labelMedium,
             color = Color(0xFF6B7385),
             modifier = modifier,
@@ -220,30 +257,76 @@ private fun NoteInspector(
         return
     }
 
+    val note = state.selectedNote
     val model = state.model
     Row(
         modifier.horizontalScroll(rememberScrollState()),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(10.dp),
     ) {
+        // With one note selected the readouts say exactly where it is; with
+        // several there is no single answer, so the count takes their place and
+        // the buttons keep working on all of them.
         NudgeField(
-            label = Pitch.nameWithOctave(note.pitch),
-            caption = if (note.hand == Hand.RIGHT) "R" else "L",
+            label = note?.let { Pitch.nameWithOctave(it.pitch) } ?: "${state.selectedNotes.size} notes",
+            caption = "pitch",
             onDown = { viewModel.nudgePitch(-1) },
             onUp = { viewModel.nudgePitch(1) },
         )
         NudgeField(
-            label = model?.let { positionLabel(it, note) } ?: "—",
+            label = "8ve",
+            caption = "transpose",
+            onDown = { viewModel.transposeOctaves(-1) },
+            onUp = { viewModel.transposeOctaves(1) },
+        )
+        NudgeField(
+            label = if (note != null && model != null) positionLabel(model, note) else "—",
             caption = "start",
             onDown = { viewModel.nudgeStart(-1) },
             onUp = { viewModel.nudgeStart(1) },
         )
         NudgeField(
-            label = lengthLabel(note, state.snapGrid, viewModel.ticksPerQuarter),
+            label = note?.let { lengthLabel(it, state.snapGrid, viewModel.ticksPerQuarter) } ?: "—",
             caption = "length",
             onDown = { viewModel.nudgeLength(-1) },
             onUp = { viewModel.nudgeLength(1) },
         )
+        HandPicker(state, viewModel)
+    }
+}
+
+/**
+ * Which hand plays the selection.
+ *
+ * Hands drive colour, the synth channel and whether hand-muting silences a note,
+ * so getting one wrong is more than cosmetic. Setting it here also *pins* it, so
+ * a linked MusicXML cannot quietly overrule the choice next time the song opens.
+ */
+@Composable
+private fun HandPicker(state: PlayerUiState, viewModel: PlayerViewModel) {
+    val hands = state.selectedNotes.map { it.hand }.distinct()
+    val current = hands.singleOrNull()
+
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        Hand.entries.forEach { hand ->
+            val selected = current == hand
+            FilterChip(
+                selected = selected,
+                onClick = { viewModel.setSelectedHand(hand) },
+                label = { Text(if (hand == Hand.RIGHT) "R" else "L", fontSize = 12.sp) },
+                colors = FilterChipDefaults.filterChipColors(
+                    selectedContainerColor =
+                        if (hand == Hand.RIGHT) HandColors.amber else HandColors.teal,
+                    selectedLabelColor = Color(0xFF14161C),
+                    containerColor = Color(0xFF1E222B),
+                    labelColor = Color(0xFFB6BDCA),
+                ),
+                modifier = Modifier.height(36.dp),
+            )
+        }
     }
 }
 
@@ -283,6 +366,16 @@ private fun NudgeField(
     }
 }
 
+/**
+ * A labelled button whose whole pill is the touch target.
+ *
+ * It previously wrapped an `IconButton` and a sibling `Text`, so it *looked* like
+ * one control roughly 80 dp wide while only the leading 32 dp square actually
+ * dispatched the click — and the parent's fixed 32 dp height constrained away
+ * Material's usual expansion to a 48 dp target as well. Tapping the word did
+ * nothing, which made Delete look broken rather than unreachable. One
+ * `clickable` on the row, sized to the accessibility minimum, is the fix.
+ */
 @Composable
 private fun ToolButton(
     label: String,
@@ -294,20 +387,33 @@ private fun ToolButton(
         Modifier
             .clip(RoundedCornerShape(8.dp))
             .background(if (enabled) Color(0xFF232935) else Color(0xFF181C24))
-            .height(32.dp),
+            .clickable(
+                enabled = enabled,
+                role = Role.Button,
+                onClickLabel = label,
+                onClick = onClick,
+            )
+            .heightIn(min = TOOL_BUTTON_HEIGHT)
+            .padding(horizontal = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
     ) {
-        IconButton(onClick = onClick, enabled = enabled, modifier = Modifier.size(32.dp)) {
-            Box(contentAlignment = Alignment.Center) { icon() }
+        Box(contentAlignment = Alignment.Center) {
+            CompositionLocalProvider(
+                LocalContentColor provides
+                    if (enabled) Color(0xFFB6BDCA) else Color(0xFF4E5666),
+            ) { icon() }
         }
         Text(
             label,
             fontSize = 12.sp,
             color = if (enabled) Color(0xFFB6BDCA) else Color(0xFF4E5666),
-            modifier = Modifier.padding(end = 10.dp),
         )
     }
 }
+
+/** The accessibility minimum, so every control in this bar is aimable. */
+private val TOOL_BUTTON_HEIGHT = 48.dp
 
 /** "14:3" — the bar and beat a note starts on, which is how music is talked about. */
 private fun positionLabel(model: HighwayModel, note: Note): String {

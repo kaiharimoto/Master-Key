@@ -469,6 +469,35 @@ class PlaybackEngine(private val context: Context) {
      * Reuses the preview voices so the release timer already running looks after
      * it, and so a tapped key cannot collide with a scrubbed one.
      */
+    /**
+     * Sounds a pitch again even if it is already ringing.
+     *
+     * [strikeKey] deliberately refuses to re-trigger a live preview voice, which
+     * is right for the drawn keyboard — a held key should sustain, not stutter.
+     * It is wrong for a note being dragged: a preview voice lives up to
+     * [PREVIEW_MAX_HOLD_MS], so dragging a note out of its lane and back inside
+     * that window would be silent exactly when you are listening for it. Here the
+     * old voice is released first so the new strike always lands.
+     */
+    fun restrikeKey(pitch: Int, hand: Hand = Hand.RIGHT) {
+        scope.launch {
+            if (!synth.isCreated) return@launch
+            val frame = synth.transportFrames()
+            previewVoices.remove(pitch)?.let { voice ->
+                synth.scheduleNoteOff(frame, voice.channel, pitch)
+            }
+            // One frame later, so the release above cannot be applied after the
+            // attack when the callback sorts events sharing a frame.
+            synth.scheduleNoteOn(frame + 1, hand.synthChannel, pitch, KEY_TAP_VELOCITY)
+            previewVoices[pitch] = PreviewVoice(
+                channel = hand.synthChannel,
+                endTick = Long.MAX_VALUE,
+                startedAtMillis = System.currentTimeMillis(),
+            )
+            startPreviewReleaseLoop()
+        }
+    }
+
     fun strikeKey(pitch: Int, hand: Hand = Hand.RIGHT) {
         scope.launch {
             if (!synth.isCreated || previewVoices.containsKey(pitch)) return@launch
@@ -481,15 +510,24 @@ class PlaybackEngine(private val context: Context) {
                 endTick = Long.MAX_VALUE,
                 startedAtMillis = System.currentTimeMillis(),
             )
-            if (previewJob == null) {
-                previewJob = scope.launch {
-                    while (previewVoices.isNotEmpty()) {
-                        releaseFinishedPreviewVoices(lastPreviewTick)
-                        delay(PREVIEW_RELEASE_INTERVAL_MS)
-                    }
-                    previewJob = null
-                }
+            startPreviewReleaseLoop()
+        }
+    }
+
+    /**
+     * Keeps the wall-clock release timer running while any preview voice rings.
+     *
+     * A finger held still sends no further events, so nothing else would ever
+     * stop the note.
+     */
+    private fun startPreviewReleaseLoop() {
+        if (previewJob != null) return
+        previewJob = scope.launch {
+            while (previewVoices.isNotEmpty()) {
+                releaseFinishedPreviewVoices(lastPreviewTick)
+                delay(PREVIEW_RELEASE_INTERVAL_MS)
             }
+            previewJob = null
         }
     }
 

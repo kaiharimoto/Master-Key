@@ -25,6 +25,8 @@ data class SongSettingsManifest(
     val countInBars: Int = 1,
     val showScore: Boolean = true,
     val lookAheadBeats: Float = 8f,
+    /** Ticks the piece has been shifted to make room before its start. */
+    val startOffsetTicks: Long = 0,
 )
 
 /**

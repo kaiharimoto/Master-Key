@@ -29,8 +29,21 @@ object HandAssigner {
 
     private const val DEFAULT_SPLIT = 60 // middle C, only as a last resort
 
-    internal fun assign(raw: List<RawNote>): List<Note> {
+    /** Where `MidiWriter` puts each hand; see its track layout. */
+    private const val RIGHT_HAND_TRACK = 1
+    private const val LEFT_HAND_TRACK = 2
+
+    internal fun assign(raw: List<RawNote>, trustTracks: Boolean = false): List<Note> {
         if (raw.isEmpty()) return emptyList()
+
+        // A file Master Key wrote *and* annotated puts the right hand on track 1
+        // and the left on track 2. Only a file carrying our own marker earns this
+        // shortcut: track 1 / track 2 is also the commonest layout from notation
+        // exporters, where "track 1 is the right hand" is exactly the convention
+        // the resolution order above says cannot be trusted.
+        if (trustTracks && raw.all { labelFromTrack(it.track) != null }) {
+            return raw.map { it.toNote(labelFromTrack(it.track)!!) }
+        }
 
         val groups = raw.groupBy { it.track to it.channel }
             .filterValues { it.isNotEmpty() }
@@ -40,6 +53,21 @@ object HandAssigner {
         } else {
             assignBySplitPoint(raw, splitPointFor(raw.map { it.pitch }))
         }
+    }
+
+    /**
+     * The hand a track means in a file this app wrote.
+     *
+     * Once someone has reassigned notes by hand, mean pitch stops being evidence:
+     * move enough of the left hand above the right and [assignByGroup] would swap
+     * *both* labels wholesale on the next load, undoing far more than was asked.
+     * And a piece pushed entirely onto one hand collapses to a single group, which
+     * is then re-split by pitch — destroying the intent outright.
+     */
+    private fun labelFromTrack(track: Int): Hand? = when (track) {
+        RIGHT_HAND_TRACK -> Hand.RIGHT
+        LEFT_HAND_TRACK -> Hand.LEFT
+        else -> null
     }
 
     /**

@@ -6,6 +6,7 @@ import dev.kaiharimoto.masterkey.core.edit.EditSession
 import dev.kaiharimoto.masterkey.core.edit.NoteDraft
 import dev.kaiharimoto.masterkey.core.midi.Pitch
 import dev.kaiharimoto.masterkey.core.model.Hand
+import dev.kaiharimoto.masterkey.core.model.KeySignature
 import dev.kaiharimoto.masterkey.core.model.Note
 import dev.kaiharimoto.masterkey.core.model.Piece
 import dev.kaiharimoto.masterkey.core.model.TempoMap
@@ -234,7 +235,7 @@ class EditSessionTest {
                     )
                 }
             }
-            if (session.apply(command) != null) applied++
+            if (session.apply(command).isNotEmpty()) applied++
 
             val notes = session.toPiece().notes
             assertThat(notes.map { it.startTick }).isInOrder()
@@ -255,12 +256,180 @@ class EditSessionTest {
     }
 
     @Test
+    fun `a batch applies and undoes as a single step`() {
+        // The whole point: transposing a chord is one press of a button, so it
+        // has to be one press of Undo — not one per note.
+        val session = EditSession(pieceOf(note(60, 0, 480), note(64, 0, 480), note(67, 0, 480)))
+        val ids = (0..2).map { session.notes.idAt(it)!! }
+
+        val touched = session.apply(
+            EditCommand.Batch(
+                ids.map { id ->
+                    EditCommand.Replace(id, session[id]!!.let { it.copy(pitch = it.pitch + 12) })
+                },
+            ),
+        )
+
+        assertThat(touched).hasSize(3)
+        assertThat(session.toPiece().notes.map { it.pitch }).containsExactly(72, 76, 79)
+
+        session.undo()
+
+        assertThat(session.toPiece().notes.map { it.pitch }).containsExactly(60, 64, 67)
+        assertThat(session.canUndo).isFalse()
+    }
+
+    @Test
+    fun `a batch undoes in reverse, so members touching one note unwind cleanly`() {
+        val session = EditSession(pieceOf(note(60, 0, 480)))
+        val id = session.notes.idAt(0)!!
+
+        session.apply(
+            EditCommand.Batch(
+                listOf(
+                    EditCommand.Replace(id, note(62, 0, 480)),
+                    EditCommand.Replace(id, note(64, 0, 480)),
+                ),
+            ),
+        )
+        assertThat(session[id]!!.pitch).isEqualTo(64)
+
+        session.undo()
+
+        assertThat(session[id]!!.pitch).isEqualTo(60)
+    }
+
+    @Test
+    fun `a batch survives a member that refers to a note already gone`() {
+        val session = EditSession(pieceOf(note(60, 0, 480), note(64, 0, 480)))
+        val live = session.notes.idAt(0)!!
+        val stale = session.notes.idAt(1)!!
+        session.apply(EditCommand.Delete(stale))
+
+        val touched = session.apply(
+            EditCommand.Batch(
+                listOf(
+                    EditCommand.Replace(stale, note(64, 0, 480)),
+                    EditCommand.Replace(live, note(60, 960, 1440)),
+                ),
+            ),
+        )
+
+        assertThat(touched).containsExactly(live)
+        assertThat(session[live]!!.startTick).isEqualTo(960)
+    }
+
+    @Test
+    fun `a batch of nothing applicable is a no-op, not a phantom undo step`() {
+        val session = EditSession(pieceOf(note(60, 0, 480)))
+        val id = session.notes.idAt(0)!!
+        session.apply(EditCommand.Delete(id))
+        val before = session.toPiece().summary()
+
+        val touched = session.apply(
+            EditCommand.Batch(listOf(EditCommand.Replace(id, note(64, 0, 480)))),
+        )
+
+        assertThat(touched).isEmpty()
+        assertThat(session.toPiece().summary()).isEqualTo(before)
+    }
+
+    @Test
+    fun `rebasing moves the notes and the markings together`() {
+        val piece = Piece(
+            notes = listOf(note(60, 0, 480), note(64, 960, 1440)),
+            tempoMap = TempoMap.build(ppq, listOf(0L to 500_000, 960L to 300_000)),
+            timeSignatures = listOf(TimeSignature(0, 3, 4)),
+            keySignatures = listOf(KeySignature(0, 2, false)),
+            endTick = 1920,
+        )
+        val session = EditSession(piece)
+
+        session.apply(EditCommand.Rebase(1440))
+        val shifted = session.toPiece()
+
+        assertThat(shifted.notes.map { it.startTick }).containsExactly(1440L, 2400L).inOrder()
+        assertThat(shifted.endTick).isEqualTo(1920 + 1440)
+        assertThat(session.offsetTicks).isEqualTo(1440)
+        // The original tempo change moved with the music...
+        assertThat(shifted.tempoMap.tempoChanges.map { it.tick }).contains(2400L)
+        // ...and the new leading bars kept the tempo and metre the piece opened
+        // with, rather than falling back to a synthetic 4/4 at 120bpm.
+        assertThat(shifted.timeSignatureAt(0).numerator).isEqualTo(3)
+        assertThat(shifted.tempoMap.bpmAt(0)).isWithin(0.01).of(120.0)
+    }
+
+    @Test
+    fun `rebasing never makes time before the piece run backwards`() {
+        // TempoMap gives elapsed-zero to its *first* change whatever tick it sits
+        // at, so shifting the tick-0 tempo without seeding a new one would make
+        // tickToMicros(0) negative and every duration in the app wrong.
+        val piece = Piece(
+            notes = listOf(note(60, 0, 480)),
+            tempoMap = TempoMap.build(ppq, listOf(0L to 400_000)),
+            timeSignatures = listOf(TimeSignature(0, 4, 4)),
+            keySignatures = emptyList(),
+            endTick = 480,
+        )
+        val session = EditSession(piece)
+
+        session.apply(EditCommand.Rebase(1920))
+        val shifted = session.toPiece()
+
+        assertThat(shifted.tempoMap.tickToMicros(0)).isAtLeast(0L)
+        assertThat(shifted.tempoMap.tickToMicros(1920)).isGreaterThan(0L)
+        assertThat(shifted.durationMicros).isGreaterThan(piece.durationMicros)
+    }
+
+    @Test
+    fun `undoing a rebase puts the piece back exactly`() {
+        val piece = pieceOf(note(60, 0, 480), note(64, 960, 1440))
+        val session = EditSession(piece)
+
+        session.apply(EditCommand.Rebase(1920))
+        session.undo()
+
+        assertThat(session.toPiece().summary()).isEqualTo(piece.summary())
+        assertThat(session.toPiece().endTick).isEqualTo(piece.endTick)
+        assertThat(session.offsetTicks).isEqualTo(0)
+    }
+
+    @Test
+    fun `a rebase and the note it made room for undo as one step`() {
+        val piece = pieceOf(note(60, 1920, 2400))
+        val session = EditSession(piece)
+
+        session.apply(
+            EditCommand.Batch(
+                listOf(EditCommand.Rebase(1920), EditCommand.Insert(note(67, 0, 480))),
+            ),
+        )
+        assertThat(session.toPiece().notes).hasSize(2)
+
+        session.undo()
+
+        assertThat(session.toPiece().summary()).isEqualTo(piece.summary())
+        assertThat(session.canUndo).isFalse()
+    }
+
+    @Test
+    fun `a rebase keeps every note's identity, so the selection survives it`() {
+        val session = EditSession(pieceOf(note(60, 0, 480), note(64, 480, 960)))
+        val id = session.notes.idAt(1)!!
+
+        session.apply(EditCommand.Rebase(960))
+
+        assertThat(session[id]).isNotNull()
+        assertThat(session[id]!!.startTick).isEqualTo(1440)
+    }
+
+    @Test
     fun `the history is capped, so a long session cannot grow without bound`() {
         val session = EditSession(pieceOf(note(60, 0, 480)))
 
         repeat(500) { session.apply(EditCommand.Insert(session.newNote(72, it * 10L, 240).toNote(1))) }
         var undos = 0
-        while (session.undo() != null) undos++
+        while (session.undo().isNotEmpty()) undos++
 
         assertThat(undos).isAtMost(200)
         // The oldest edits are forgotten rather than half-applied: what remains

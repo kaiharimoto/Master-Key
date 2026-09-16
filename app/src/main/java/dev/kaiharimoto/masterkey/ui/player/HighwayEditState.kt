@@ -4,6 +4,7 @@ import androidx.compose.runtime.Stable
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.mutableStateOf
 import dev.kaiharimoto.masterkey.core.edit.NoteDraft
 import dev.kaiharimoto.masterkey.core.edit.SnapGrid
 import dev.kaiharimoto.masterkey.core.model.Hand
@@ -50,7 +51,54 @@ class HighwayEditState {
      */
     val zoom = mutableFloatStateOf(1f)
 
+    /**
+     * The marquee rectangle, in pixels, while one is being drawn.
+     *
+     * Four floats rather than a `Rect` so a sweep allocates nothing per frame,
+     * for the same reason the ghost is loose scalars. [marqueeActive] gates them.
+     */
+    val marqueeActive = mutableStateOf(false)
+    val marqueeLeft = mutableFloatStateOf(0f)
+    val marqueeTop = mutableFloatStateOf(0f)
+    val marqueeRight = mutableFloatStateOf(0f)
+    val marqueeBottom = mutableFloatStateOf(0f)
+
+    /**
+     * A whole selection being dragged, held as one offset rather than per note.
+     *
+     * Storing a moved copy of every selected note would allocate on every frame
+     * of the drag; an offset is two numbers however many notes are moving, and
+     * the draw phase applies it to each selected note as it goes.
+     */
+    val groupDragging = mutableStateOf(false)
+    val groupDeltaTicks = mutableLongStateOf(0L)
+    val groupDeltaPitch = mutableIntStateOf(0)
+
     val ghosting: Boolean get() = ghostPitch.intValue >= 0
+
+    fun showGroupDrag(deltaTicks: Long, deltaPitch: Int) {
+        groupDeltaTicks.longValue = deltaTicks
+        groupDeltaPitch.intValue = deltaPitch
+        groupDragging.value = true
+    }
+
+    fun clearGroupDrag() {
+        groupDragging.value = false
+        groupDeltaTicks.longValue = 0L
+        groupDeltaPitch.intValue = 0
+    }
+
+    fun showMarquee(x0: Float, y0: Float, x1: Float, y1: Float) {
+        marqueeLeft.floatValue = minOf(x0, x1)
+        marqueeRight.floatValue = maxOf(x0, x1)
+        marqueeTop.floatValue = minOf(y0, y1)
+        marqueeBottom.floatValue = maxOf(y0, y1)
+        marqueeActive.value = true
+    }
+
+    fun clearMarquee() {
+        marqueeActive.value = false
+    }
 
     fun showGhost(index: Int, draft: NoteDraft) {
         dragIndex.intValue = index

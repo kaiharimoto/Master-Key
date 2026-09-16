@@ -53,6 +53,10 @@ object HighwayColors {
     /** Where a note being dragged used to be, so the move reads as a move. */
     val editGhostOrigin = Color(0x2EE8ECF5)
     val editSnapLine = Color(0xFF1A1F29)
+    val editMarqueeFill = Color(0x1FE8ECF5)
+
+    /** The empty space before bar 1, offered for a pickup or an introduction. */
+    val editPreRoll = Color(0xFF12151C)
 }
 
 private val DarkScheme = darkColorScheme(

@@ -88,14 +88,31 @@ fun NoteHighway(
     editing: Boolean = false,
     edit: HighwayEditState? = null,
     snapGrid: SnapGrid = SnapGrid.DEFAULT,
-    selectedIndex: Int = HighwayHitTest.NONE,
+    /** Indices into `model.notes` that are selected, ascending. */
+    selectedIndices: List<Int> = emptyList(),
+    /** True while taps add to the selection and an empty drag draws a marquee. */
+    selectMode: Boolean = false,
     snapAnchorAt: ((Long) -> Long)? = null,
     onSelect: ((Int) -> Unit)? = null,
+    onSelectRange: ((List<Int>) -> Unit)? = null,
     onDraftAt: ((Int) -> NoteDraft?)? = null,
     onNewNoteDraft: ((pitch: Int, startTick: Long, lengthTicks: Long) -> NoteDraft?)? = null,
     onCommitDrag: ((index: Int, draft: NoteDraft, minLengthTicks: Long) -> Unit)? = null,
     onInsertNote: ((draft: NoteDraft, minLengthTicks: Long) -> Unit)? = null,
+    /** Commits a drag that moved a whole selection, as one offset. */
+    onCommitGroupDrag: ((deltaTicks: Long, deltaPitch: Int) -> Unit)? = null,
     onLookAheadCommitted: ((Float) -> Unit)? = null,
+    /**
+     * Sounds a pitch while a note is being dragged.
+     *
+     * Separate from [onKeyTapped] because the two want opposite behaviour on a
+     * repeat: tapping the drawn keyboard should not re-trigger a key that is
+     * already ringing, while dragging a note back into a lane it just left
+     * must, or the drag goes quiet exactly when it matters.
+     */
+    onAudition: ((Int) -> Unit)? = null,
+    /** How far before bar 1 the view may scroll, so the empty space can be shown. */
+    preRollTicks: Long = 0L,
 ) {
     val density = LocalDensity.current
     val textMeasurer = rememberTextMeasurer()
@@ -120,8 +137,15 @@ fun NoteHighway(
     // go stale *and* cannot cancel anything.
     val latestSettings by rememberUpdatedState(settings)
     val latestRange by rememberUpdatedState(range)
-    val latestSelected by rememberUpdatedState(selectedIndex)
     val latestGrid by rememberUpdatedState(snapGrid)
+
+    // Turned into a primitive array once per composition, not per frame: the
+    // draw phase asks "is this index selected" for every visible note, and
+    // boxing an Integer per question is the kind of thing that only shows up as
+    // jank once a piece gets long.
+    val selection = remember(selectedIndices) { selectedIndices.toIntArray() }
+    val latestSelection by rememberUpdatedState(selection)
+    val latestSelectMode by rememberUpdatedState(selectMode)
 
     // Animating the visible span as two floats is what allows a smooth pan
     // between key ranges rather than a jump from one keyboard layout to another.
@@ -200,7 +224,7 @@ fun NoteHighway(
                         keyLineY = keyLineY,
                         pixelsPerTick = pixelsPerTick,
                         minTouchPx = minTouchPx,
-                        preferIndex = latestSelected,
+                        preferIndex = latestSelection.firstOrNull() ?: HighwayHitTest.NONE,
                     )
                 } else {
                     HighwayHitTest.NONE
@@ -214,12 +238,14 @@ fun NoteHighway(
                     down = down,
                     editing = editing,
                     overANote = hitIndex != HighwayHitTest.NONE,
+                    selectMode = latestSelectMode,
                 )
 
                 when (intent) {
                     Intent.TRANSFORM -> runTransform(
                         pixelsPerTick = pixelsPerTick,
                         startTick = positionTicks.longValue,
+                        preRollTicks = preRollTicks,
                         edit = edit,
                         settings = latestSettings,
                         onScrubStart = onScrubStart,
@@ -242,7 +268,26 @@ fun NoteHighway(
                         }
                     }
 
-                    Intent.EDIT_DRAG -> runNoteDrag(
+                    // Dragging any note of a multi-note selection moves the
+                    // whole selection; resizing a group is not an operation this
+                    // editor has, so a group drag is always a move.
+                    Intent.EDIT_DRAG -> if (
+                        latestSelection.size > 1 && latestSelection.contains(hitIndex)
+                    ) {
+                        runGroupDrag(
+                            pointerId = down.id,
+                            down = down.position,
+                            layout = layout,
+                            range = latestRange,
+                            grid = latestGrid,
+                            ticksPerQuarter = model.piece.tempoMap.ticksPerQuarter,
+                            snapAnchorAt = snapAnchorAt,
+                            anchorDraft = onDraftAt?.invoke(hitIndex),
+                            pixelsPerTick = pixelsPerTick,
+                            edit = edit,
+                            onCommitGroupDrag = onCommitGroupDrag,
+                        )
+                    } else runNoteDrag(
                         pointerId = down.id,
                         index = hitIndex,
                         down = down.position,
@@ -259,7 +304,7 @@ fun NoteHighway(
                         onSelect = onSelect,
                         onDraftAt = onDraftAt,
                         onCommitDrag = onCommitDrag,
-                        onKeyTapped = onKeyTapped,
+                        onAudition = onAudition ?: onKeyTapped,
                     )
 
                     Intent.CREATE -> runNoteDraw(
@@ -276,7 +321,7 @@ fun NoteHighway(
                         edit = edit,
                         onNewNoteDraft = onNewNoteDraft,
                         onInsertNote = onInsertNote,
-                        onKeyTapped = onKeyTapped,
+                        onKeyTapped = onAudition ?: onKeyTapped,
                     )
 
                     Intent.SCRUB -> {
@@ -291,11 +336,23 @@ fun NoteHighway(
                             // direction the music travels, and the opposite sign
                             // to the drag.
                             tick -= change.positionChange().y / pixelsPerTick
-                            scrubTo(tick.toLong().coerceAtLeast(0L))
+                            scrubTo(tick.toLong().coerceAtLeast(-preRollTicks))
                             change.consume()
                         }
                         onScrubEnd?.invoke()
                     }
+
+                    Intent.MARQUEE -> runMarquee(
+                        pointerId = down.id,
+                        down = down.position,
+                        model = model,
+                        layout = layout,
+                        playheadTick = positionTicks.longValue,
+                        keyLineY = keyLineY,
+                        pixelsPerTick = pixelsPerTick,
+                        edit = edit,
+                        onSelectRange = onSelectRange,
+                    )
 
                     Intent.NONE -> Unit
                 }
@@ -322,6 +379,9 @@ fun NoteHighway(
         // Read once per frame, like the playhead above it, and never in the
         // composable body — that is the whole reason this state exists.
         val dragIndex = edit?.dragIndex?.intValue ?: HighwayEditState.NO_DRAG
+        val groupDragging = editing && edit != null && edit.groupDragging.value
+        val groupDeltaTicks = if (groupDragging) edit!!.groupDeltaTicks.longValue else 0L
+        val groupDeltaPitch = if (groupDragging) edit!!.groupDeltaPitch.intValue else 0
         val ghost = if (editing && edit != null && edit.ghosting) {
             GhostNote(
                 pitch = edit.ghostPitch.intValue,
@@ -335,6 +395,23 @@ fun NoteHighway(
         drawRect(HighwayColors.background)
 
         drawLanes(layout, range, keyLineY)
+
+        // The space before the piece starts, drawn as a distinct region so the
+        // emptiness reads as room you may use rather than as a failure to draw.
+        if (preRollTicks > 0L) {
+            val startY = HighwayHitTest.yAt(0L, position, keyLineY, pixelsPerTick)
+            // Only when the start of the piece is actually on screen. Without the
+            // upper bound the rectangle gets a negative height as soon as the
+            // playhead moves past bar 1.
+            if (startY > 0f && startY < keyLineY) {
+                drawRect(
+                    color = HighwayColors.editPreRoll,
+                    topLeft = Offset(0f, startY),
+                    size = Size(width, keyLineY - startY),
+                )
+                drawRect(HighwayColors.barLine, Offset(0f, startY), Size(width, 2f))
+            }
+        }
 
         if (settings.showBeatGrid) {
             drawGrid(model, position, lookAheadTicks, pixelsPerTick, keyLineY, width, labelCache)
@@ -370,9 +447,12 @@ fun NoteHighway(
                 labelCache = labelCache,
                 soundingOut = sounding,
                 editing = editing,
-                selectedIndex = selectedIndex,
+                selection = selection,
                 dragIndex = dragIndex,
                 handlePx = handlePx,
+                groupDragging = groupDragging,
+                groupDeltaTicks = groupDeltaTicks,
+                groupDeltaPitch = groupDeltaPitch,
             )
 
             ghost?.let {
@@ -383,6 +463,20 @@ fun NoteHighway(
                     keyLineY = keyLineY,
                     layout = layout,
                     cornerPx = cornerPx,
+                )
+            }
+
+            if (editing && edit != null && edit.marqueeActive.value) {
+                val left = edit.marqueeLeft.floatValue
+                val top = edit.marqueeTop.floatValue
+                val boxWidth = edit.marqueeRight.floatValue - left
+                val boxHeight = edit.marqueeBottom.floatValue - top
+                drawRect(HighwayColors.editMarqueeFill, Offset(left, top), Size(boxWidth, boxHeight))
+                drawRect(
+                    color = HighwayColors.editSelection,
+                    topLeft = Offset(left, top),
+                    size = Size(boxWidth, boxHeight),
+                    style = Stroke(width = 1.5f),
                 )
             }
         }
@@ -438,6 +532,9 @@ private enum class Intent {
     /** A second finger arrived: pinch to zoom, drag to scroll. */
     TRANSFORM,
 
+    /** Select mode, dragging across empty space: sweep up everything it touches. */
+    MARQUEE,
+
     /** Nothing to do. */
     NONE,
 }
@@ -456,6 +553,7 @@ private suspend fun AwaitPointerEventScope.awaitIntent(
     down: PointerInputChange,
     editing: Boolean,
     overANote: Boolean,
+    selectMode: Boolean,
 ): Intent {
     var travelled = Offset.Zero
     val longPressAt = System.nanoTime() + LONG_PRESS_NANOS
@@ -476,15 +574,25 @@ private suspend fun AwaitPointerEventScope.awaitIntent(
         // two-dimensional slop. Everything else scrolls the music, which is a
         // vertical gesture — and measuring it vertically is what stops a
         // sideways swipe from being read as a scrub, exactly as before.
-        val slopped = if (editing && overANote) {
+        val slopped = if (editing && (overANote || selectMode)) {
+            // A note drag moves sideways as well as along, and a marquee is
+            // drawn in both directions, so both want two-dimensional slop.
             travelled.getDistance() > viewConfiguration.touchSlop
         } else {
+            // Everything else scrolls the music, which is a vertical gesture —
+            // and measuring it vertically is what stops a sideways swipe being
+            // read as a scrub, exactly as before edit mode existed.
             abs(travelled.y) > viewConfiguration.touchSlop
         }
         if (slopped) {
             return when {
                 !editing -> Intent.SCRUB
                 overANote -> Intent.EDIT_DRAG
+                // With the lasso on, an empty-lane drag sweeps a selection
+                // instead of scrolling. Two-finger pan still scrolls, so
+                // navigation never disappears — which is the whole reason this
+                // is a mode rather than a gesture stolen from somewhere.
+                selectMode -> Intent.MARQUEE
                 // An empty-lane drag still scrolls while editing. It is the only
                 // one-finger way through the piece now that tap-to-seek is gone,
                 // and the alternative — a drag that does nothing — is worse.
@@ -510,6 +618,7 @@ private suspend fun AwaitPointerEventScope.awaitIntent(
 private suspend fun AwaitPointerEventScope.runTransform(
     pixelsPerTick: Float,
     startTick: Long,
+    preRollTicks: Long,
     edit: HighwayEditState?,
     settings: ScaffoldSettings,
     onScrubStart: (() -> Unit)?,
@@ -537,7 +646,7 @@ private suspend fun AwaitPointerEventScope.runTransform(
         val pan = event.calculatePan()
         if (pan.y != 0f && pixelsPerTick > 0f) {
             tick -= pan.y / pixelsPerTick
-            onScrubTo?.invoke(tick.toLong().coerceAtLeast(0L))
+            onScrubTo?.invoke(tick.toLong().coerceAtLeast(-preRollTicks))
         }
 
         event.changes.forEach { it.consume() }
@@ -553,6 +662,55 @@ private suspend fun AwaitPointerEventScope.runTransform(
         // the look-ahead slider shows are the same one.
         onLookAheadCommitted?.invoke(Math.round(committed * 2f) / 2f)
     }
+}
+
+/**
+ * Sweeping a box across empty space to select what it touches.
+ *
+ * The selection is published continuously rather than on release, so you can see
+ * what the box has caught while you are still drawing it — a marquee that only
+ * reports at the end is a guess until you let go.
+ */
+private suspend fun AwaitPointerEventScope.runMarquee(
+    pointerId: PointerId,
+    down: Offset,
+    model: HighwayModel,
+    layout: HighwayLayout,
+    playheadTick: Long,
+    keyLineY: Float,
+    pixelsPerTick: Float,
+    edit: HighwayEditState?,
+    onSelectRange: ((List<Int>) -> Unit)?,
+) {
+    var corner = down
+    var lastHits = emptyList<Int>()
+    edit?.showMarquee(down.x, down.y, down.x, down.y)
+
+    drag(pointerId) { change ->
+        corner += change.positionChange()
+        edit?.showMarquee(down.x, down.y, corner.x, corner.y)
+
+        val hits = HighwayHitTest.notesIn(
+            model = model,
+            layout = layout,
+            left = minOf(down.x, corner.x),
+            top = minOf(down.y, corner.y),
+            right = maxOf(down.x, corner.x),
+            bottom = maxOf(down.y, corner.y).coerceAtMost(keyLineY),
+            playheadTick = playheadTick,
+            keyLineY = keyLineY,
+            pixelsPerTick = pixelsPerTick,
+        )
+        // Only republish when the catch actually changed; a sweep across empty
+        // space would otherwise rebuild the selection on every frame.
+        if (hits != lastHits) {
+            lastHits = hits
+            onSelectRange?.invoke(hits)
+        }
+        change.consume()
+    }
+
+    edit?.clearMarquee()
 }
 
 /** Dragging an existing note: move it, or take one of its ends. */
@@ -573,7 +731,7 @@ private suspend fun AwaitPointerEventScope.runNoteDrag(
     onSelect: ((Int) -> Unit)?,
     onDraftAt: ((Int) -> NoteDraft?)?,
     onCommitDrag: ((Int, NoteDraft, Long) -> Unit)?,
-    onKeyTapped: ((Int) -> Unit)?,
+    onAudition: ((Int) -> Unit)?,
 ) {
     val original = onDraftAt?.invoke(index) ?: return
     onSelect?.invoke(index)
@@ -585,7 +743,12 @@ private suspend fun AwaitPointerEventScope.runNoteDrag(
     val anchor = snapAnchorAt?.invoke(original.startTick) ?: 0L
 
     var current = original
-    var lastPitch = original.pitch
+    // What was last auditioned. Tracked as the whole snapped shape, not just the
+    // pitch: a note dragged straight up keeps its pitch, and a note resized by a
+    // grip cannot change pitch at all, so a pitch-only gate left both of those —
+    // which is most of what editing is — completely silent.
+    var soundedPitch = -1
+    var soundedStart = Long.MIN_VALUE
     var travelled = Offset.Zero
 
     drag(pointerId) { change ->
@@ -610,18 +773,65 @@ private suspend fun AwaitPointerEventScope.runNoteDrag(
         )
         edit?.showGhost(index, current)
 
-        // Sound the note each time it crosses into a new lane, so moving one is
-        // audible rather than purely visual. Bounded by pitch changes, not by
-        // frames, so a slow drag does not machine-gun.
-        if (current.pitch != lastPitch) {
-            lastPitch = current.pitch
-            onKeyTapped?.invoke(current.pitch)
+        // Sound the note whenever it lands somewhere new — a different lane or a
+        // different beat. Gated on the *snapped* values rather than on frames, so
+        // a slow drag within one grid step stays quiet instead of machine-gunning,
+        // and every crossing of a grid line is heard.
+        if (current.pitch != soundedPitch || current.startTick != soundedStart) {
+            soundedPitch = current.pitch
+            soundedStart = current.startTick
+            onAudition?.invoke(current.pitch)
         }
         change.consume()
     }
 
     edit?.clearGhost()
     if (current != original) onCommitDrag?.invoke(index, current, minLength)
+}
+
+/**
+ * Dragging a whole selection.
+ *
+ * The snap is taken from the note actually under the finger and the resulting
+ * offset applied to every other note unchanged, so the passage keeps its internal
+ * rhythm. Snapping each note independently would quantise the group flat.
+ */
+private suspend fun AwaitPointerEventScope.runGroupDrag(
+    pointerId: PointerId,
+    down: Offset,
+    layout: HighwayLayout,
+    range: KeyRange,
+    grid: SnapGrid,
+    ticksPerQuarter: Int,
+    snapAnchorAt: ((Long) -> Long)?,
+    anchorDraft: NoteDraft?,
+    pixelsPerTick: Float,
+    edit: HighwayEditState?,
+    onCommitGroupDrag: ((Long, Int) -> Unit)?,
+) {
+    val anchorNote = anchorDraft ?: return
+    val gridAnchor = snapAnchorAt?.invoke(anchorNote.startTick) ?: 0L
+    val startLane = HighwayHitTest.laneAt(layout, down.x, range.low, range.high)
+
+    var travelled = Offset.Zero
+    var deltaTicks = 0L
+    var deltaPitch = 0
+
+    drag(pointerId) { change ->
+        travelled += change.positionChange()
+        // Snap where the dragged note lands, then keep the difference.
+        val wanted = anchorNote.startTick + (-travelled.y / pixelsPerTick).toLong()
+        deltaTicks = grid.snap(wanted, ticksPerQuarter, gridAnchor) - anchorNote.startTick
+
+        val lane = HighwayHitTest.laneAt(layout, down.x + travelled.x, range.low, range.high)
+        if (lane != null && startLane != null) deltaPitch = lane - startLane
+
+        edit?.showGroupDrag(deltaTicks, deltaPitch)
+        change.consume()
+    }
+
+    edit?.clearGroupDrag()
+    if (deltaTicks != 0L || deltaPitch != 0) onCommitGroupDrag?.invoke(deltaTicks, deltaPitch)
 }
 
 /** Long-pressed on empty space: draw a new note, dragging upwards to lengthen it. */
@@ -779,9 +989,12 @@ private fun DrawScope.drawNotes(
     labelCache: TextLayoutCache,
     soundingOut: MutableList<Note>,
     editing: Boolean = false,
-    selectedIndex: Int = HighwayHitTest.NONE,
+    selection: IntArray = IntArray(0),
     dragIndex: Int = HighwayEditState.NO_DRAG,
     handlePx: Float = 0f,
+    groupDragging: Boolean = false,
+    groupDeltaTicks: Long = 0L,
+    groupDeltaPitch: Int = 0,
 ) {
     val horizon = position + lookAheadTicks
     val notes = model.notes
@@ -852,8 +1065,38 @@ private fun DrawScope.drawNotes(
             )
         }
 
-        if (editing && here == selectedIndex) {
-            drawSelection(left, top, noteWidth, noteHeight, cornerPx, handlePx)
+        if (editing && selection.contains(here)) {
+            if (groupDragging) {
+                // The whole selection is on the move: show where it came from,
+                // faintly, and where it is going, brightly — the same
+                // origin-and-ghost reading a single note gets.
+                drawRoundRect(
+                    color = HighwayColors.editGhostOrigin,
+                    topLeft = Offset(left, top),
+                    size = Size(noteWidth, noteHeight),
+                    cornerRadius = CornerRadius(cornerPx),
+                )
+                drawGhost(
+                    ghost = GhostNote(
+                        pitch = note.pitch + groupDeltaPitch,
+                        startTick = note.startTick + groupDeltaTicks,
+                        endTick = note.endTick + groupDeltaTicks,
+                    ),
+                    position = position,
+                    pixelsPerTick = pixelsPerTick,
+                    keyLineY = keyLineY,
+                    layout = layout,
+                    cornerPx = cornerPx,
+                )
+            } else {
+                // Grips only make sense on a lone note: two of them on each of a
+                // dozen selected notes is clutter, and resizing a group is not an
+                // operation this editor has.
+                drawSelection(
+                    left, top, noteWidth, noteHeight, cornerPx,
+                    handlePx = if (selection.size == 1) handlePx else 0f,
+                )
+            }
         }
 
         drawNoteAnnotations(

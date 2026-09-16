@@ -299,6 +299,7 @@ private fun PlayerContent(
                     modifier = Modifier.fillMaxSize(),
                     zoom = latest.scoreZoom,
                     loadError = latest.scoreError,
+                    offsetTicks = latest.startOffsetTicks,
                     onEvent = viewModel::onScoreEvent,
                 )
             }
@@ -325,25 +326,31 @@ private fun PlayerContent(
                 // playhead is overridden for the UI while the engine is left
                 // alone until the finger lifts.
                 //
-                // While editing the preview is off: hearing every note you drag
-                // past is what makes scrubbing usable for finding a passage, and
-                // exactly what makes it intolerable while placing notes.
-                onScrubStart = {
-                    if (latest.editing) viewModel.beginScrub() else viewModel.beginScrubWithPreview()
-                },
+                // Previewing stays on while editing. It was switched off there
+                // at first, on the theory that hearing notes go past would be a
+                // distraction while placing them; that had it backwards. Dragging
+                // the music past the key line is how you check whether the edit
+                // you just made actually sounds right, and a silent editor makes
+                // you save and leave edit mode to find out.
+                onScrubStart = viewModel::beginScrubWithPreview,
                 onScrubTo = viewModel::updateScrub,
                 onScrubEnd = viewModel::endScrub,
                 editing = latest.editing,
                 edit = editState,
                 snapGrid = latest.snapGrid,
-                selectedIndex = latest.selectedIndex,
+                selectedIndices = latest.selectedIndices,
+                selectMode = latest.selectMode,
+                onSelectRange = viewModel::selectRange,
                 snapAnchorAt = viewModel::snapAnchor,
                 onSelect = viewModel::select,
                 onDraftAt = viewModel::noteDraftAt,
                 onNewNoteDraft = viewModel::draftForNewNote,
                 onCommitDrag = viewModel::commitDrag,
                 onInsertNote = viewModel::insertNote,
+                onCommitGroupDrag = viewModel::commitGroupDrag,
+                preRollTicks = if (latest.editing) viewModel.preRollTicks() else 0L,
                 onLookAheadCommitted = viewModel::setLookAheadBeats,
+                onAudition = viewModel::auditionPitch,
                 modifier = paneModifier,
             )
         }

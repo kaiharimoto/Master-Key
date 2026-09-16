@@ -535,6 +535,7 @@ class SongRepository(
                     countInBars = settings.countInBars,
                     showScore = settings.showScore,
                     lookAheadBeats = settings.lookAheadBeats,
+                    startOffsetTicks = settings.startOffsetTicks,
                 ),
             )
             recovered++
@@ -635,6 +636,7 @@ fun SongEntity.toManifest(
         countInBars = countInBars,
         showScore = showScore,
         lookAheadBeats = lookAheadBeats,
+        startOffsetTicks = startOffsetTicks,
     ),
 )
 

@@ -32,6 +32,17 @@ data class Note(
     val finger: Int? = null,
     /** Verovio `xml:id` of the notehead, for highlighting the score. */
     val scoreId: String? = null,
+    /**
+     * True when the hand was chosen by the user rather than inferred.
+     *
+     * Hands are not stored in a MIDI file; they are guessed on load, and when a
+     * MusicXML is linked they are re-derived from its staff every time the song
+     * opens. Without this flag a hand the user set by hand would be silently
+     * undone on the next launch — and only for the notes the score happened to
+     * match, leaving the piece half-reverted, which reads as a bug rather than
+     * as a policy.
+     */
+    val handPinned: Boolean = false,
 ) {
     val durationTicks: Long get() = endTick - startTick
 
